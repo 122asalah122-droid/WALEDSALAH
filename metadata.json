@@ -1,0 +1,6 @@
+{
+  "name": "تحدي الابطال :مسابقة لايف",
+  "description": "تطبيق تحدي الابطال :مسابقة لايف الحديث بمؤثرات صوتية كاملة وغرفة دردشة وتحدي 4 لاعبين باللغتين العربية والإنجليزية جاهز لـ AppCreator24 وجوجل بلاي.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
