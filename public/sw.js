@@ -1,4 +1,4 @@
-const CACHE_NAME = 'champions-quiz-offline-v2';
+const CACHE_NAME = 'champions-quiz-offline-v3';
 
 const PRECACHE_URLS = [
   '/',

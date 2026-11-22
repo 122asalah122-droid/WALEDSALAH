@@ -1,4 +1,13 @@
-import Peer, { DataConnection, MediaConnection } from 'peerjs';
+import {
+  ref,
+  set,
+  push,
+  remove,
+  onValue,
+  onChildAdded,
+  onDisconnect,
+} from 'firebase/database';
+import { rtdb, sanitizeFirebaseKey } from './firebaseClient';
 import { ChatMessage } from '../types/game';
 
 export type CallMode = 'audio' | 'video';
@@ -72,43 +81,161 @@ export function generatePrivateRoomCode(): string {
 }
 
 export function normalizePrivateRoomCode(input: string): string {
-  const digits = String(input || '')
+  return String(input || '')
     .trim()
     .replace(/^PRIV-/i, '')
     .replace(/\D/g, '')
     .slice(0, 4);
-  return digits;
 }
 
-const ICE_SERVERS: RTCIceServer[] = [
+// Metered STUN + TURN Relay configuration for reliable cross-network / mobile / Android WebView WebRTC
+const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env || {};
+const METERED_TURN_USERNAME = env.VITE_TURN_USERNAME || 'c89281151b67d76b612ff2';
+const METERED_TURN_CREDENTIAL = env.VITE_TURN_CREDENTIAL || '2KTt047g0zNjzh5pG';
+
+export const ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.relay.metered.ca:80' },
+  {
+    urls: 'turn:global.relay.metered.ca:80',
+    username: METERED_TURN_USERNAME,
+    credential: METERED_TURN_CREDENTIAL,
+  },
+  {
+    urls: 'turn:global.relay.metered.ca:80?transport=tcp',
+    username: METERED_TURN_USERNAME,
+    credential: METERED_TURN_CREDENTIAL,
+  },
+  {
+    urls: 'turn:global.relay.metered.ca:443',
+    username: METERED_TURN_USERNAME,
+    credential: METERED_TURN_CREDENTIAL,
+  },
+  {
+    urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+    username: METERED_TURN_USERNAME,
+    credential: METERED_TURN_CREDENTIAL,
+  },
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
 ];
+
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: ICE_SERVERS,
+  iceCandidatePoolSize: 10,
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require',
+};
+
+type LegacyNavigator = Navigator & {
+  getUserMedia?: (
+    c: MediaStreamConstraints,
+    ok: (s: MediaStream) => void,
+    err: (e: unknown) => void
+  ) => void;
+  webkitGetUserMedia?: (
+    c: MediaStreamConstraints,
+    ok: (s: MediaStream) => void,
+    err: (e: unknown) => void
+  ) => void;
+  mozGetUserMedia?: (
+    c: MediaStreamConstraints,
+    ok: (s: MediaStream) => void,
+    err: (e: unknown) => void
+  ) => void;
+};
+
+/**
+ * Android WebView & Cross-Browser safe getUserMedia wrapper.
+ * Supports modern navigator.mediaDevices.getUserMedia and legacy WebView webkitGetUserMedia.
+ */
+async function getUserMediaSafe(constraints: MediaStreamConstraints): Promise<MediaStream> {
+  if (typeof navigator === 'undefined') {
+    throw new Error('Navigator unavailable');
+  }
+  if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
+    return navigator.mediaDevices.getUserMedia(constraints);
+  }
+  const legacyNav = navigator as LegacyNavigator;
+  const legacyFn =
+    legacyNav.webkitGetUserMedia || legacyNav.mozGetUserMedia || legacyNav.getUserMedia;
+  if (typeof legacyFn === 'function') {
+    return new Promise<MediaStream>((resolve, reject) => {
+      legacyFn.call(legacyNav, constraints, resolve, reject);
+    });
+  }
+  throw new Error('getUserMedia not supported');
+}
+
+function isMediaCaptureSupported(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
+    return true;
+  }
+  const legacyNav = navigator as LegacyNavigator;
+  return Boolean(
+    legacyNav.webkitGetUserMedia || legacyNav.mozGetUserMedia || legacyNav.getUserMedia
+  );
+}
+
+function formatWebViewPermissionError(err: unknown, needsCamera: boolean): string {
+  if (typeof window !== 'undefined' && window.isSecureContext === false) {
+    return 'يلزم فتح التطبيق عبر رابط HTTPS آمن لتشغيل الميكروفون والكاميرا.';
+  }
+  const name = err instanceof DOMException ? err.name : (err as { name?: string })?.name || '';
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+    return needsCamera
+      ? 'تم رفض إذن الكاميرا أو الميكروفون. يرجى تفعيل صلاحيات الكاميرا والميكروفون للتطبيق من إعدادات الهاتف/المتصفح.'
+      : 'تم رفض إذن الميكروفون. يرجى السماح بصلاحية الميكروفون للتطبيق من إعدادات الهاتف/المتصفح.';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return needsCamera
+      ? 'لم يتم العثور على كاميرا أو ميكروفون متاح على هذا الجهاز.'
+      : 'لم يتم العثور على ميكروفون متاح على هذا الجهاز.';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return 'الميكروفون أو الكاميرا قيد الاستخدام في تطبيق آخر حالياً. أغلقه وحاول مجدداً.';
+  }
+  return needsCamera
+    ? 'تعذر فتح الكاميرا والميكروفون. تأكد من السماح بالأذونات داخل التطبيق.'
+    : 'تعذر تشغيل الميكروفون. تأكد من السماح بإذن الميكروفون داخل التطبيق.';
+}
+
+interface RtcSignalPayload {
+  id: string;
+  fromId: string;
+  fromName: string;
+  fromAvatar: string;
+  toId?: string;
+  type: 'offer' | 'answer' | 'ice' | 'ring' | 'accept' | 'reject' | 'hangup' | 'media_state';
+  callMode?: CallMode;
+  matchMic?: boolean;
+  payload?: unknown;
+  ts: number;
+}
 
 class RtcCallManager {
   private peerId: string;
   private profileName = 'متسابق';
   private profileAvatar = '👑';
 
-  // PeerJS primary & room-discovery instances
-  private peer: Peer | null = null;
+  // Firebase RTDB connection & room signaling state
   private peerReady = false;
   private peerError: string | null = null;
-  private roomHostPeer: Peer | null = null;
-  private dataConns = new Map<string, DataConnection>();
-  private mediaConns = new Map<string, MediaConnection>();
-  private hostGuestConns = new Map<string, DataConnection>();
-  private roomPeersMap = new Map<string, RtcParticipant>();
-  private pendingMediaCalls = new Map<string, MediaConnection>();
+  private signalingRoomId = '';
+  private unsubParticipants: (() => void) | null = null;
+  private unsubSignals: (() => void) | null = null;
+  private unsubConnected: (() => void) | null = null;
+  private presenceTimer: ReturnType<typeof setInterval> | null = null;
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Native WebRTC Mesh peer connections for reliable 1v1 & 4-Player room voice
-  private meshPcs = new Map<string, RTCPeerConnection>();
-  private meshPendingIce = new Map<string, RTCIceCandidateInit[]>();
-  private meshMakingOffer = new Map<string, boolean>();
+  // Native WebRTC Mesh connections (used for BOTH 1v1/4P Match Voice AND Private Video/Voice Calls)
+  private pcs = new Map<string, RTCPeerConnection>();
+  private pcModeMap = new Map<string, 'match' | 'call'>();
+  private pendingIce = new Map<string, RTCIceCandidateInit[]>();
+  private makingOffer = new Map<string, boolean>();
+  private lastDialAttemptMap = new Map<string, number>();
+  private processedSignalIds = new Set<string>();
+  private remoteTrackStreams = new Map<string, MediaStream>();
 
   private micStream: MediaStream | null = null;
   private camStream: MediaStream | null = null;
@@ -137,18 +264,10 @@ class RtcCallManager {
   private remoteStreamsMap = new Map<string, RemotePeerStream>();
   private matchRemoteStreamsMap = new Map<string, RemotePeerStream>();
   private participants: RtcParticipant[] = [];
+  private roomPeersMap = new Map<string, RtcParticipant>();
   private blockedPeersMap = new Map<string, BlockedCaller>();
   private incomingCall: IncomingCallAlert | null = null;
   private callStatusText: string | null = null;
-
-  private ws: WebSocket | null = null;
-  private sse: EventSource | null = null;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private presenceTimer: ReturnType<typeof setInterval> | null = null;
-  private matchMicReconcileTimer: ReturnType<typeof setInterval> | null = null;
-  private lastDialAttemptMap = new Map<string, number>();
-  private lastSignalSeq = 0;
-  private processedSignalIds = new Set<string>();
 
   private audioCtx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
@@ -201,19 +320,11 @@ class RtcCallManager {
     this.saveBlockedPeers();
     this.removeRemotePeer(peerId);
 
-    const dc = this.dataConns.get(peerId);
-    if (dc) {
-      try {
-        dc.close();
-      } catch {}
-      this.dataConns.delete(peerId);
-    }
-
     if (this.incomingCall?.fromId === peerId) {
       const room = this.incomingCall.roomId;
       this.incomingCall = null;
       this.stopRingTone();
-      this.sendServerSignal(room, peerId, 'reject', {});
+      this.sendFirebaseSignal(room, peerId, 'reject', {}).catch(() => {});
     }
 
     this.roomPeersMap.delete(peerId);
@@ -263,7 +374,9 @@ class RtcCallManager {
     };
   }
 
-  public subscribeChat(fn: (roomId: string, msg: ChatMessage, deletedId?: string) => void): () => void {
+  public subscribeChat(
+    fn: (roomId: string, msg: ChatMessage, deletedId?: string) => void
+  ): () => void {
     this.chatListeners.add(fn);
     return () => {
       this.chatListeners.delete(fn);
@@ -320,406 +433,12 @@ class RtcCallManager {
     });
   }
 
-  // =========================================================================
-  // PeerJS Initialization & Room Mesh Discovery (Mobile <-> Laptop Internet)
-  // =========================================================================
-  private ensurePeerJsInitialized(roomId: string) {
-    if (this.peer && !this.peer.destroyed) {
-      if (this.peer.disconnected) {
-        try {
-          this.peer.reconnect();
-        } catch {}
-      }
-      if (this.peerReady) {
-        this.joinPeerJsRoomCoordinator(roomId);
-      }
-      return;
-    }
-
-    try {
-      const peer = new Peer(this.peerId, {
-        debug: 1,
-        secure: true,
-        config: { iceServers: ICE_SERVERS },
-      });
-      this.peer = peer;
-      this.peerError = null;
-
-      peer.on('open', (id) => {
-        this.peerId = id;
-        this.peerReady = true;
-        this.peerError = null;
-        this.emit();
-        const targetRoom = this.matchMicRoomId || this.activeRoomId || this.watchedRoomId || roomId;
-        if (targetRoom) {
-          this.joinPeerJsRoomCoordinator(targetRoom);
-        }
-        if (this.matchMicRoomId && !this.inCall) {
-          this.connectMatchMicPeers();
-        }
-      });
-
-      peer.on('connection', (conn) => {
-        this.setupDataConnection(conn);
-      });
-
-      peer.on('call', (mediaConn) => {
-        this.handleIncomingPeerMediaCall(mediaConn);
-      });
-
-      peer.on('disconnected', () => {
-        this.peerReady = false;
-        this.emit();
-        setTimeout(() => {
-          if (this.peer && !this.peer.destroyed && this.peer.disconnected) {
-            try {
-              this.peer.reconnect();
-            } catch {}
-          }
-        }, 1800);
-      });
-
-      peer.on('error', (err) => {
-        const errType = (err as { type?: string })?.type || '';
-        if (errType === 'peer-unavailable') return;
-        this.peerError = errType || 'peer_error';
-        this.emit();
-      });
-    } catch {
-      this.peerError = 'peer_init_failed';
-      this.emit();
-    }
-  }
-
-  // Claim or connect to deterministic 4-digit room coordinator ID on PeerJS Cloud
-  private joinPeerJsRoomCoordinator(roomId: string) {
-    if (!roomId || !this.peer || this.peer.destroyed) return;
-    const hostPeerId = `champions_room_${roomId}`;
-
-    // Clean old coordinator if switching rooms
-    if (this.roomHostPeer && !this.roomHostPeer.destroyed) {
-      if (this.roomHostPeer.id === hostPeerId) {
-        return;
-      }
-      try {
-        this.roomHostPeer.destroy();
-      } catch {}
-      this.roomHostPeer = null;
-      this.hostGuestConns.clear();
-    }
-
-    try {
-      const hostPeer = new Peer(hostPeerId, {
-        debug: 0,
-        secure: true,
-        config: { iceServers: ICE_SERVERS },
-      });
-      this.roomHostPeer = hostPeer;
-
-      hostPeer.on('open', () => {
-        // Claimed room host slot for roomId! Add ourselves to roomPeersMap
-        this.upsertRoomPeer({
-          peerId: this.peerId,
-          name: this.profileName,
-          avatar: this.profileAvatar,
-          callMode: this.callMode,
-          micOn: this.micOn,
-          camOn: this.camOn,
-          inCall: this.inCall,
-          lastSeen: Date.now(),
-        });
-      });
-
-      hostPeer.on('connection', (guestConn) => {
-        guestConn.on('open', () => {
-          this.hostGuestConns.set(guestConn.peer, guestConn);
-          // Send existing peers roster + self to newly joined guest
-          const roster = Array.from(this.roomPeersMap.values());
-          try {
-            guestConn.send({ type: 'roster', roomId, peers: roster });
-          } catch {}
-        });
-        guestConn.on('data', (raw: unknown) => {
-          const msg = raw as Record<string, unknown>;
-          if (!msg || typeof msg !== 'object') return;
-          if (msg.type === 'hello' && msg.participant) {
-            const p = msg.participant as RtcParticipant;
-            if (!this.blockedPeersMap.has(p.peerId)) {
-              this.upsertRoomPeer(p);
-              this.connectDataPeer(p.peerId);
-              // Broadcast updated roster to all guests on coordinator channel
-              const roster = Array.from(this.roomPeersMap.values());
-              this.hostGuestConns.forEach((c) => {
-                if (c.open) {
-                  try {
-                    c.send({ type: 'roster', roomId, peers: roster });
-                  } catch {}
-                }
-              });
-            }
-          } else if (msg.type === 'chat' || msg.type === 'chat_delete') {
-            this.hostGuestConns.forEach((c) => {
-              if (c.peer !== guestConn.peer && c.open) {
-                try {
-                  c.send(msg);
-                } catch {}
-              }
-            });
-            this.handleDataPayload(guestConn.peer, msg);
-          }
-        });
-        guestConn.on('close', () => {
-          this.hostGuestConns.delete(guestConn.peer);
-        });
-      });
-
-      hostPeer.on('error', (err) => {
-        const errType = (err as { type?: string })?.type || '';
-        // If room host ID already exists, another device (e.g. Mobile or Laptop) already hosts this room!
-        if (errType === 'unavailable-id') {
-          try {
-            hostPeer.destroy();
-          } catch {}
-          this.roomHostPeer = null;
-          this.connectToPeerJsHostSlot(hostPeerId, roomId);
-        }
-      });
-    } catch {}
-  }
-
-  private connectToPeerJsHostSlot(hostPeerId: string, roomId: string) {
-    if (!this.peer || this.peer.destroyed || !this.peerReady) return;
-    try {
-      const conn = this.peer.connect(hostPeerId, { reliable: true });
-      conn.on('open', () => {
-        this.dataConns.set(hostPeerId, conn);
-        try {
-          conn.send({
-            type: 'hello',
-            roomId,
-            participant: {
-              peerId: this.peerId,
-              name: this.profileName,
-              avatar: this.profileAvatar,
-              callMode: this.callMode,
-              micOn: this.micOn,
-              camOn: this.camOn,
-              inCall: this.inCall,
-              lastSeen: Date.now(),
-            },
-          });
-        } catch {}
-      });
-      conn.on('data', (raw) => {
-        this.handleDataPayload(conn.peer, raw);
-      });
-      conn.on('close', () => {
-        this.dataConns.delete(hostPeerId);
-      });
-    } catch {}
-  }
-
-  private connectDataPeer(remotePeerId: string) {
-    if (!remotePeerId || remotePeerId === this.peerId || this.blockedPeersMap.has(remotePeerId)) return;
-    if (!this.peer || this.peer.destroyed || !this.peerReady) return;
-    const existing = this.dataConns.get(remotePeerId);
-    if (existing && existing.open) return;
-
-    try {
-      const conn = this.peer.connect(remotePeerId, {
-        reliable: true,
-        metadata: {
-          roomId: this.activeRoomId || this.watchedRoomId,
-          name: this.profileName,
-          avatar: this.profileAvatar,
-        },
-      });
-      this.setupDataConnection(conn);
-    } catch {}
-  }
-
-  private setupDataConnection(conn: DataConnection) {
-    const remoteId = conn.peer;
-    if (this.blockedPeersMap.has(remoteId)) {
-      try {
-        conn.close();
-      } catch {}
-      return;
-    }
-
-    conn.on('open', () => {
-      this.dataConns.set(remoteId, conn);
-      try {
-        conn.send({
-          type: 'hello',
-          roomId: this.activeRoomId || this.watchedRoomId,
-          participant: {
-            peerId: this.peerId,
-            name: this.profileName,
-            avatar: this.profileAvatar,
-            callMode: this.callMode,
-            micOn: this.micOn,
-            camOn: this.camOn,
-            inCall: this.inCall,
-            lastSeen: Date.now(),
-          },
-        });
-      } catch {}
-    });
-
-    conn.on('data', (raw) => {
-      this.handleDataPayload(remoteId, raw);
-    });
-
-    conn.on('close', () => {
-      this.dataConns.delete(remoteId);
-    });
-
-    conn.on('error', () => {
-      this.dataConns.delete(remoteId);
-    });
-  }
-
-  private upsertRoomPeer(p: RtcParticipant) {
-    if (!p || !p.peerId || this.blockedPeersMap.has(p.peerId)) return;
-    this.roomPeersMap.set(p.peerId, { ...p, lastSeen: Date.now() });
-    if (p.peerId !== this.peerId && this.peerReady) {
-      this.connectDataPeer(p.peerId);
-      if (this.matchMicRoomId && !this.inCall && !this.mediaConns.has(p.peerId)) {
-        this.connectMatchMicPeer(p);
-      }
-    }
-    this.emit();
-  }
-
-  private handleDataPayload(fromPeerId: string, raw: unknown) {
-    if (!raw || typeof raw !== 'object') return;
-    const msg = raw as Record<string, unknown>;
-    if (this.blockedPeersMap.has(fromPeerId)) return;
-
-    const currentRoom = this.activeRoomId || this.watchedRoomId;
-    if (typeof msg.roomId === 'string' && currentRoom && msg.roomId !== currentRoom) return;
-
-    if (msg.type === 'hello' && msg.participant) {
-      const p = msg.participant as RtcParticipant;
-      this.upsertRoomPeer(p);
-      return;
-    }
-
-    if (msg.type === 'roster' && Array.isArray(msg.peers)) {
-      (msg.peers as RtcParticipant[]).forEach((p) => {
-        if (p && p.peerId && !this.blockedPeersMap.has(p.peerId)) {
-          this.roomPeersMap.set(p.peerId, p);
-          if (p.peerId !== this.peerId) {
-            this.connectDataPeer(p.peerId);
-          }
-        }
-      });
-      this.emit();
-      return;
-    }
-
-    if (msg.type === 'chat' && msg.message) {
-      const chatMsg = msg.message as ChatMessage;
-      if (this.blockedPeersMap.has(chatMsg.senderId)) return;
-      this.chatListeners.forEach((fn) => {
-        try {
-          fn(currentRoom, chatMsg);
-        } catch {}
-      });
-      return;
-    }
-
-    if (msg.type === 'chat_delete' && typeof msg.messageId === 'string') {
-      this.chatListeners.forEach((fn) => {
-        try {
-          fn(currentRoom, {} as ChatMessage, String(msg.messageId));
-        } catch {}
-      });
-      return;
-    }
-
-    if (msg.type === 'media_state' && msg.participant) {
-      const p = msg.participant as RtcParticipant;
-      this.upsertRoomPeer(p);
-      const remote = this.remoteStreamsMap.get(p.peerId);
-      if (remote) {
-        remote.micOn = p.micOn;
-        remote.camOn = p.camOn;
-        remote.callMode = p.callMode;
-      }
-      this.emit();
-      return;
-    }
-
-    if (msg.type === 'ring') {
-      if (!this.inCall && currentRoom) {
-        this.incomingCall = {
-          roomId: currentRoom,
-          fromId: String(msg.fromId || fromPeerId),
-          fromName: String(msg.fromName || 'صديق'),
-          fromAvatar: String(msg.fromAvatar || '👤'),
-          callMode: msg.callMode === 'video' ? 'video' : 'audio',
-          timestamp: Date.now(),
-        };
-        this.startRingTone();
-        this.emit();
-      }
-      return;
-    }
-
-    if (msg.type === 'hangup') {
-      const pid = String(msg.fromId || fromPeerId);
-      this.removeRemotePeer(pid);
-      if (this.incomingCall?.fromId === pid) {
-        this.incomingCall = null;
-        this.stopRingTone();
-      }
-      this.emit();
-      return;
-    }
-
-    if (msg.type === 'reject') {
-      this.callStatusText = `${String(msg.fromName || 'الطرف الآخر')} رفض المكالمة`;
-      this.emit();
-    }
-  }
-
-  private broadcastDataToPeers(payload: Record<string, unknown>) {
-    this.dataConns.forEach((conn) => {
-      if (conn.open) {
-        try {
-          conn.send(payload);
-        } catch {}
-      }
-    });
-    this.hostGuestConns.forEach((conn) => {
-      if (conn.open) {
-        try {
-          conn.send(payload);
-        } catch {}
-      }
-    });
-  }
-
-  public sendRoomChatMessage(roomId: string, msg: ChatMessage) {
-    this.broadcastDataToPeers({
-      type: 'chat',
-      roomId,
-      message: msg,
-    });
-  }
-
-  public broadcastDeleteChatMessage(roomId: string, messageId: string) {
-    this.broadcastDataToPeers({
-      type: 'chat_delete',
-      roomId,
-      messageId,
-    });
-  }
+  // Kept for compatibility with RoomsCallModal (chat now persists directly in Firebase RTDB)
+  public sendRoomChatMessage(_roomId: string, _msg: ChatMessage) {}
+  public broadcastDeleteChatMessage(_roomId: string, _messageId: string) {}
 
   // =========================================================================
-  // Audio & Video Media Acquisition + Live Mic Controls
+  // Audio & Video Media Acquisition (Android WebView Friendly)
   // =========================================================================
   public async ensureAutoMicActive(): Promise<boolean> {
     if (this.userDisabledMic) {
@@ -732,23 +451,9 @@ class RtcCallManager {
 
   private getVoiceAudioConstraints(): MediaTrackConstraints {
     return {
-      echoCancellation: { ideal: true },
-      noiseSuppression: { ideal: true },
-      autoGainControl: { ideal: true },
-      channelCount: { ideal: 1 },
-      sampleRate: { ideal: 48000 },
-      sampleSize: { ideal: 16 },
-      // Chromium / Android WebView hardware DSP speech flags
-      ...({
-        googEchoCancellation: true,
-        googEchoCancellation2: true,
-        googAutoGainControl: true,
-        googAutoGainControl2: true,
-        googNoiseSuppression: true,
-        googNoiseSuppression2: true,
-        googHighpassFilter: true,
-        googTypingNoiseDetection: true,
-      } as Record<string, boolean>),
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
     };
   }
 
@@ -762,7 +467,10 @@ class RtcCallManager {
               sender.track.contentHint = 'speech';
             }
           } catch {}
-          if (typeof sender.getParameters === 'function' && typeof sender.setParameters === 'function') {
+          if (
+            typeof sender.getParameters === 'function' &&
+            typeof sender.setParameters === 'function'
+          ) {
             const params = sender.getParameters();
             if (params && Array.isArray(params.encodings) && params.encodings.length > 0) {
               const enc = params.encodings[0] as RTCRtpEncodingParameters & {
@@ -779,9 +487,25 @@ class RtcCallManager {
     } catch {}
   }
 
+  private unlockAudioContextInGesture() {
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (AudioCtx) {
+        if (!this.audioCtx || this.audioCtx.state === 'closed') {
+          this.audioCtx = new AudioCtx();
+        }
+        if (this.audioCtx.state === 'suspended') {
+          this.audioCtx.resume().catch(() => {});
+        }
+      }
+    } catch {}
+  }
+
   private async acquireMicrophone(enableTrack: boolean): Promise<boolean> {
-    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-      this.micPermissionError = 'المتصفح لا يدعم الوصول للميكروفون';
+    if (!isMediaCaptureSupported()) {
+      this.micPermissionError = 'المتصفح الحالي لا يدعم الوصول إلى الميكروفون';
       this.emit();
       return false;
     }
@@ -797,24 +521,26 @@ class RtcCallManager {
       this.micReady = true;
       this.micPermissionError = null;
       this.rebuildCombinedStream();
+      this.syncTracksToAllPcs();
       this.emit();
       return true;
     }
 
     let stream: MediaStream | null = null;
+    let lastErr: unknown = null;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
+      stream = await getUserMediaSafe({
         audio: this.getVoiceAudioConstraints(),
         video: false,
       });
-    } catch {
+    } catch (e1) {
+      lastErr = e1;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: false,
-        });
-      } catch {
-        this.micPermissionError = 'يرجى السماح بصلاحية الميكروفون';
+        // Android WebView minimal fallback
+        stream = await getUserMediaSafe({ audio: true, video: false });
+      } catch (e2) {
+        lastErr = e2;
+        this.micPermissionError = formatWebViewPermissionError(lastErr, false);
         this.micReady = false;
         this.emit();
         return false;
@@ -833,18 +559,17 @@ class RtcCallManager {
     this.micPermissionError = null;
     this.startMicLevelMonitor(stream);
     this.rebuildCombinedStream();
-    this.syncTracksToAllPeerJsConns();
+    this.syncTracksToAllPcs();
     this.emit();
     return true;
   }
 
   /**
    * Called directly inside the "متابعة" (Continue) click handler on the Permissions Screen
-   * BEFORE entering the 1v1 or 4-player room. Triggers real getUserMedia({ audio: true })
-   * and unlocks browser AudioContext so remote <audio> playback & local mic tracks are ready.
+   * BEFORE entering 1v1 or 4-player rooms. Safe for Android WebView & iOS Safari.
    */
   public async requestMicPermissionOnContinue(): Promise<{ granted: boolean; error?: string }> {
-    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+    if (!isMediaCaptureSupported()) {
       const err = 'المتصفح الحالي لا يدعم الوصول إلى الميكروفون';
       this.micPermissionError = err;
       this.emit();
@@ -852,20 +577,7 @@ class RtcCallManager {
     }
 
     this.userDisabledMic = false;
-
-    try {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (AudioCtx) {
-        if (!this.audioCtx) {
-          this.audioCtx = new AudioCtx();
-        }
-        if (this.audioCtx.state === 'suspended') {
-          await this.audioCtx.resume().catch(() => {});
-        }
-      }
-    } catch {}
+    this.unlockAudioContextInGesture();
 
     if (this.micStream && this.micStream.getAudioTracks().some((t) => t.readyState === 'live')) {
       this.micStream.getAudioTracks().forEach((t) => {
@@ -878,25 +590,22 @@ class RtcCallManager {
       this.micReady = true;
       this.micPermissionError = null;
       this.rebuildCombinedStream();
-      this.syncTracksToAllPeerJsConns();
+      this.syncTracksToAllPcs();
       this.emit();
       return { granted: true };
     }
 
     let stream: MediaStream | null = null;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
+      stream = await getUserMediaSafe({
         audio: this.getVoiceAudioConstraints(),
         video: false,
       });
     } catch {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await getUserMediaSafe({ audio: true });
       } catch (err) {
-        const msg =
-          err instanceof DOMException && err.name === 'NotAllowedError'
-            ? 'تم رفض إذن الميكروفون. يرجى السماح بالوصول للميكروفون من إعدادات المتصفح.'
-            : 'تعذر تشغيل الميكروفون. تأكد من توصيل الميكروفون والسماح بالإذن.';
+        const msg = formatWebViewPermissionError(err, false);
         this.micPermissionError = msg;
         this.micReady = false;
         this.emit();
@@ -916,9 +625,130 @@ class RtcCallManager {
     this.micPermissionError = null;
     this.startMicLevelMonitor(stream);
     this.rebuildCombinedStream();
-    this.syncTracksToAllPeerJsConns();
+    this.syncTracksToAllPcs();
     this.emit();
     return { granted: true };
+  }
+
+  /**
+   * Single-call Audio + Video acquisition for Video Calls (critical for Android WebView
+   * so WebChromeClient.onPermissionRequest prompts once for both camera & microphone!).
+   */
+  private async acquireCombinedAudioVideo(facing: 'user' | 'environment'): Promise<boolean> {
+    if (!isMediaCaptureSupported()) return false;
+    this.stopCamera();
+
+    const attempts: MediaStreamConstraints[] = [
+      {
+        audio: this.getVoiceAudioConstraints(),
+        video: {
+          facingMode: { ideal: facing },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+        },
+      },
+      {
+        audio: true,
+        video: { facingMode: facing },
+      },
+      {
+        audio: true,
+        video: true,
+      },
+    ];
+
+    for (const constraints of attempts) {
+      try {
+        const stream = await getUserMediaSafe(constraints);
+        const audioTracks = stream.getAudioTracks();
+        const videoTracks = stream.getVideoTracks();
+
+        if (audioTracks.length > 0) {
+          if (this.micStream) {
+            this.micStream.getAudioTracks().forEach((t) => t.stop());
+          }
+          const newMic = new MediaStream(audioTracks);
+          audioTracks.forEach((t) => {
+            t.enabled = !this.userDisabledMic;
+            try {
+              if ('contentHint' in t) t.contentHint = 'speech';
+            } catch {}
+          });
+          this.micStream = newMic;
+          this.micOn = !this.userDisabledMic;
+          this.micReady = true;
+          this.micPermissionError = null;
+          this.startMicLevelMonitor(newMic);
+        }
+
+        if (videoTracks.length > 0) {
+          this.camStream = new MediaStream(videoTracks);
+          this.camOn = true;
+          this.facingMode = facing;
+        }
+
+        this.rebuildCombinedStream();
+        this.syncTracksToAllPcs();
+        this.emit();
+        return videoTracks.length > 0;
+      } catch {
+        // Try next simpler constraint set for Android WebView compatibility
+      }
+    }
+
+    // Fallback: acquire audio only so voice call still works even if camera is unavailable
+    await this.acquireMicrophone(!this.userDisabledMic);
+    this.camOn = false;
+    this.callStatusText = 'تعذر تشغيل الكاميرا — مستمر بالصوت المباشر';
+    this.emit();
+    return false;
+  }
+
+  private async acquireCamera(facing: 'user' | 'environment'): Promise<boolean> {
+    if (!isMediaCaptureSupported()) return false;
+    this.stopCamera();
+
+    const attempts: MediaStreamConstraints[] = [
+      {
+        video: {
+          facingMode: { ideal: facing },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+        },
+        audio: false,
+      },
+      { video: { facingMode: facing }, audio: false },
+      { video: true, audio: false },
+    ];
+
+    for (const constraints of attempts) {
+      try {
+        const stream = await getUserMediaSafe(constraints);
+        if (stream.getVideoTracks().length > 0) {
+          this.camStream = stream;
+          this.camOn = true;
+          this.facingMode = facing;
+          this.rebuildCombinedStream();
+          this.syncTracksToAllPcs();
+          this.emit();
+          return true;
+        }
+      } catch {}
+    }
+
+    this.camOn = false;
+    this.callStatusText = 'تعذر تشغيل الكاميرا — مستمر بالصوت';
+    this.emit();
+    return false;
+  }
+
+  private stopCamera() {
+    if (this.camStream) {
+      this.camStream.getTracks().forEach((t) => t.stop());
+      this.camStream = null;
+    }
+    this.camOn = false;
+    this.rebuildCombinedStream();
   }
 
   private startMicLevelMonitor(stream: MediaStream) {
@@ -970,13 +800,12 @@ class RtcCallManager {
     const next = !this.micOn;
     this.userDisabledMic = !next;
     if (next) {
+      this.unlockAudioContextInGesture();
       const ok = await this.acquireMicrophone(true);
       if (ok && (this.inCall || this.matchMicRoomId)) {
-        this.syncTracksToAllPeerJsConns();
+        this.syncTracksToAllPcs();
         await this.publishMediaState();
-        if (this.matchMicRoomId) {
-          this.connectMatchMicPeers();
-        }
+        this.reconcileConnections();
       }
       return ok;
     } else {
@@ -1015,131 +844,7 @@ class RtcCallManager {
     this.combinedStream = tracks.length > 0 ? new MediaStream(tracks) : null;
   }
 
-  private syncTracksToAllPeerJsConns() {
-    const stream = this.combinedStream;
-    if (!stream) return;
-    this.mediaConns.forEach((mc) => {
-      const pc = mc.peerConnection;
-      if (!pc) return;
-      const senders = pc.getSenders();
-      stream.getTracks().forEach((track) => {
-        const existing = senders.find((s) => s.track && s.track.kind === track.kind);
-        if (existing) {
-          existing.replaceTrack(track).catch(() => {});
-        } else {
-          pc.addTrack(track, stream);
-        }
-      });
-      this.tuneAudioSender(pc);
-    });
-
-    // Also update audio tracks on all active Native WebRTC Mesh peer connections
-    const audioTrack = stream.getAudioTracks().find((t) => t.readyState === 'live');
-    if (audioTrack) {
-      this.meshPcs.forEach((pc) => {
-        try {
-          if (pc.connectionState === 'closed' || pc.signalingState === 'closed') return;
-          const audioSender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
-          if (audioSender) {
-            audioSender.replaceTrack(audioTrack).catch(() => {});
-          } else {
-            pc.addTrack(audioTrack, stream);
-          }
-          this.tuneAudioSender(pc);
-        } catch {}
-      });
-    }
-  }
-
-  // =========================================================================
-  // Private Room Presence & Dual Signaling (PeerJS + Server WebSocket/HTTP)
-  // =========================================================================
-  public watchRoom(roomId: string) {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      this.callStatusText = 'مطلوب اتصال بالإنترنت لتشغيل الغرف والمكالمات';
-      this.emit();
-      return;
-    }
-    const cleanRoom = (roomId || '').trim();
-    if (!cleanRoom) return;
-    if (this.watchedRoomId === cleanRoom && (this.ws || this.sse) && this.peer) return;
-
-    this.watchedRoomId = cleanRoom;
-    if (!this.inCall) {
-      this.activeRoomId = cleanRoom;
-    }
-    this.roomPeersMap.clear();
-    this.ensurePeerJsInitialized(cleanRoom);
-    this.connectSignaling(cleanRoom);
-    this.registerRoomPresence(cleanRoom, this.inCall);
-    this.emit();
-  }
-
-  public stopWatching() {
-    if (this.inCall) {
-      this.hangup();
-    }
-    const prevRoom = this.watchedRoomId;
-    this.incomingCall = null;
-    this.stopRingTone();
-    this.watchedRoomId = '';
-    this.activeRoomId = '';
-    this.participants = [];
-    this.roomPeersMap.clear();
-    this.disconnectSignaling();
-
-    if (prevRoom) {
-      fetch(`/api/rooms/${encodeURIComponent(prevRoom)}/rtc/leave`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ peerId: this.peerId }),
-      }).catch(() => {});
-    }
-
-    this.dataConns.forEach((c) => {
-      try {
-        c.close();
-      } catch {}
-    });
-    this.dataConns.clear();
-    if (this.roomHostPeer) {
-      try {
-        this.roomHostPeer.destroy();
-      } catch {}
-      this.roomHostPeer = null;
-    }
-    this.hostGuestConns.clear();
-    this.emit();
-  }
-
-  private async registerRoomPresence(roomId: string, inCall: boolean) {
-    try {
-      const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/rtc/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          peerId: this.peerId,
-          name: this.profileName,
-          avatar: this.profileAvatar,
-          callMode: this.callMode,
-          micOn: this.micOn,
-          camOn: this.camOn,
-          inCall,
-        }),
-      });
-      const data = await res.json();
-      if (data && data.success && Array.isArray(data.participants)) {
-        this.syncDiscoveredParticipants(data.participants as RtcParticipant[]);
-      }
-    } catch {}
-  }
-
-  // Create a silent audio stream fallback so PeerJS can always exchange audio
-  // even if one side currently has mic muted or blocked (so they still hear their friend!)
-  private getOrCreateCallStream(): MediaStream | null {
-    if (this.combinedStream && this.combinedStream.getTracks().some((t) => t.readyState === 'live')) {
-      return this.combinedStream;
-    }
+  private getOrCreateSilentAudioStream(): MediaStream | null {
     try {
       if (!this.silentAudioStream) {
         const AudioCtx =
@@ -1164,6 +869,306 @@ class RtcCallManager {
     }
   }
 
+  private getLocalStreamForMode(mode: 'match' | 'call'): MediaStream | null {
+    if (mode === 'match') {
+      if (this.micStream && this.micStream.getAudioTracks().some((t) => t.readyState === 'live')) {
+        return this.micStream;
+      }
+      return this.getOrCreateSilentAudioStream();
+    }
+    if (this.combinedStream && this.combinedStream.getTracks().some((t) => t.readyState === 'live')) {
+      return this.combinedStream;
+    }
+    return this.getOrCreateSilentAudioStream();
+  }
+
+  private syncTracksToAllPcs(): boolean {
+    let addedNewTrack = false;
+    this.pcs.forEach((pc, remotePeerId) => {
+      try {
+        if (pc.connectionState === 'closed' || pc.signalingState === 'closed') return;
+        const pcMode = this.pcModeMap.get(remotePeerId) || 'match';
+        const stream = this.getLocalStreamForMode(pcMode);
+        if (!stream) return;
+
+        const senders = pc.getSenders();
+        const audioTrack = stream.getAudioTracks().find((t) => t.readyState === 'live');
+        if (audioTrack) {
+          const audioSender = senders.find((s) => s.track && s.track.kind === 'audio');
+          if (audioSender) {
+            if (audioSender.track !== audioTrack) {
+              audioSender.replaceTrack(audioTrack).catch(() => {});
+            }
+          } else {
+            pc.addTrack(audioTrack, stream);
+            addedNewTrack = true;
+          }
+          this.tuneAudioSender(pc);
+        }
+
+        if (pcMode === 'call') {
+          const videoTrack =
+            this.camOn && this.camStream
+              ? this.camStream.getVideoTracks().find((t) => t.readyState === 'live')
+              : null;
+          const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
+          if (videoTrack) {
+            if (videoSender) {
+              if (videoSender.track !== videoTrack) {
+                videoSender.replaceTrack(videoTrack).catch(() => {});
+              }
+            } else {
+              pc.addTrack(videoTrack, stream);
+              addedNewTrack = true;
+            }
+          } else if (videoSender) {
+            videoSender.replaceTrack(null).catch(() => {});
+          }
+        }
+      } catch {}
+    });
+    return addedNewTrack;
+  }
+
+  // =========================================================================
+  // Firebase Realtime Database Signaling & Presence (ZERO Local Server)
+  // =========================================================================
+  private connectFirebaseSignaling(roomId: string) {
+    const cleanRoom = sanitizeFirebaseKey(roomId);
+    if (!cleanRoom) return;
+    if (this.signalingRoomId === cleanRoom && this.unsubParticipants && this.unsubSignals) {
+      return;
+    }
+
+    this.disconnectFirebaseSignaling();
+    this.signalingRoomId = cleanRoom;
+    this.processedSignalIds.clear();
+
+    // Track live Firebase RTDB connection state
+    const connectedRef = ref(rtdb, '.info/connected');
+    this.unsubConnected = onValue(
+      connectedRef,
+      (snap) => {
+        const connected = snap.val() === true;
+        this.peerReady = connected;
+        this.peerError = connected ? null : 'connecting';
+        if (connected && this.signalingRoomId) {
+          this.publishMediaState().catch(() => {});
+        }
+        this.emit();
+      },
+      () => {}
+    );
+
+    // Watch all participants in this RTC room
+    const participantsRef = ref(rtdb, `rtc_rooms/${cleanRoom}/participants`);
+    this.unsubParticipants = onValue(
+      participantsRef,
+      (snap) => {
+        const now = Date.now();
+        const raw = (snap.val() || {}) as Record<string, RtcParticipant>;
+        const activeList: RtcParticipant[] = [];
+        const activeIds = new Set<string>();
+
+        Object.values(raw).forEach((p) => {
+          if (!p || !p.peerId) return;
+          // Ignore stale ghost entries older than 75s
+          if (p.peerId !== this.peerId && p.lastSeen && now - p.lastSeen > 75000) return;
+          if (this.blockedPeersMap.has(p.peerId)) return;
+          activeList.push(p);
+          activeIds.add(p.peerId);
+        });
+
+        // Clean up peers who left
+        Array.from(this.roomPeersMap.keys()).forEach((pid) => {
+          if (!activeIds.has(pid)) {
+            this.roomPeersMap.delete(pid);
+            this.removeRemotePeer(pid);
+          }
+        });
+
+        this.participants = activeList;
+        activeList.forEach((p) => {
+          this.roomPeersMap.set(p.peerId, p);
+          const remoteCall = this.remoteStreamsMap.get(p.peerId);
+          if (remoteCall) {
+            remoteCall.micOn = p.micOn;
+            remoteCall.camOn = p.camOn;
+            remoteCall.callMode = p.callMode;
+          }
+          const remoteMatch = this.matchRemoteStreamsMap.get(p.peerId);
+          if (remoteMatch) {
+            remoteMatch.micOn = p.micOn;
+          }
+        });
+
+        this.reconcileConnections();
+        this.emit();
+      },
+      () => {}
+    );
+
+    // Listen to incoming WebRTC signals (offer / answer / ice / ring / hangup / reject)
+    const signalsRef = ref(rtdb, `rtc_rooms/${cleanRoom}/signals`);
+    const listenStartedAt = Date.now() - 8000;
+    this.unsubSignals = onChildAdded(
+      signalsRef,
+      (snap) => {
+        const sig = snap.val() as RtcSignalPayload | null;
+        if (!sig || !sig.fromId || sig.fromId === this.peerId) return;
+        if (sig.ts && sig.ts < listenStartedAt) return;
+        const sigKey = snap.key || sig.id;
+        if (sig.toId && sig.toId !== this.peerId) return;
+
+        void this.handleIncomingSignal({ ...sig, id: sig.id || sigKey || '' });
+
+        // Delete targeted consumed signals so RTDB stays lean and fast
+        if (sig.toId === this.peerId && snap.key) {
+          remove(ref(rtdb, `rtc_rooms/${cleanRoom}/signals/${snap.key}`)).catch(() => {});
+        }
+      },
+      () => {}
+    );
+
+    // Heartbeat presence every 15s + periodic WebRTC reconciler
+    this.presenceTimer = setInterval(() => {
+      if (this.signalingRoomId) {
+        this.publishMediaState().catch(() => {});
+      }
+    }, 15000);
+
+    this.reconcileTimer = setInterval(() => {
+      this.runPeriodicReconciler();
+    }, 2400);
+  }
+
+  private disconnectFirebaseSignaling() {
+    const prevRoom = this.signalingRoomId;
+    this.signalingRoomId = '';
+
+    if (this.unsubParticipants) {
+      try {
+        this.unsubParticipants();
+      } catch {}
+      this.unsubParticipants = null;
+    }
+    if (this.unsubSignals) {
+      try {
+        this.unsubSignals();
+      } catch {}
+      this.unsubSignals = null;
+    }
+    if (this.unsubConnected) {
+      try {
+        this.unsubConnected();
+      } catch {}
+      this.unsubConnected = null;
+    }
+    if (this.presenceTimer) {
+      clearInterval(this.presenceTimer);
+      this.presenceTimer = null;
+    }
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = null;
+    }
+    if (prevRoom) {
+      const cleanPeer = sanitizeFirebaseKey(this.peerId);
+      remove(ref(rtdb, `rtc_rooms/${prevRoom}/participants/${cleanPeer}`)).catch(() => {});
+    }
+  }
+
+  private async registerRoomPresence(roomId: string, inCall: boolean) {
+    const cleanRoom = sanitizeFirebaseKey(roomId);
+    const cleanPeer = sanitizeFirebaseKey(this.peerId);
+    if (!cleanRoom || !cleanPeer) return;
+
+    const participantRef = ref(rtdb, `rtc_rooms/${cleanRoom}/participants/${cleanPeer}`);
+    const payload: RtcParticipant = {
+      peerId: this.peerId,
+      name: this.profileName,
+      avatar: this.profileAvatar,
+      callMode: this.callMode,
+      micOn: this.micOn,
+      camOn: this.camOn,
+      inCall,
+      lastSeen: Date.now(),
+    };
+
+    try {
+      await set(participantRef, payload);
+      onDisconnect(participantRef).remove().catch(() => {});
+    } catch {}
+  }
+
+  private async sendFirebaseSignal(
+    roomId: string,
+    toId: string | undefined,
+    type: RtcSignalPayload['type'],
+    payload: unknown,
+    callMode?: CallMode,
+    matchMic?: boolean
+  ) {
+    const cleanRoom = sanitizeFirebaseKey(roomId || this.activeRoomId || this.watchedRoomId);
+    if (!cleanRoom) return;
+
+    const sigRef = push(ref(rtdb, `rtc_rooms/${cleanRoom}/signals`));
+    const data: Record<string, unknown> = {
+      id: sigRef.key || `sig_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      fromId: this.peerId,
+      fromName: this.profileName,
+      fromAvatar: this.profileAvatar,
+      type,
+      callMode: callMode || this.callMode,
+      matchMic: Boolean(matchMic),
+      payload: payload ?? null,
+      ts: Date.now(),
+    };
+    if (toId) data.toId = toId;
+
+    await set(sigRef, data).catch(() => {});
+  }
+
+  // =========================================================================
+  // Room Watch & Match Voice Session (1v1 & 4-Player)
+  // =========================================================================
+  public watchRoom(roomId: string) {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      this.callStatusText = 'مطلوب اتصال بالإنترنت لتشغيل الغرف والمكالمات';
+      this.emit();
+      return;
+    }
+    const cleanRoom = (roomId || '').trim();
+    if (!cleanRoom) return;
+    if (this.watchedRoomId === cleanRoom && this.signalingRoomId === sanitizeFirebaseKey(cleanRoom)) {
+      return;
+    }
+
+    this.watchedRoomId = cleanRoom;
+    if (!this.inCall) {
+      this.activeRoomId = cleanRoom;
+    }
+    this.roomPeersMap.clear();
+    this.connectFirebaseSignaling(cleanRoom);
+    void this.registerRoomPresence(cleanRoom, this.inCall);
+    this.emit();
+  }
+
+  public stopWatching() {
+    if (this.inCall) {
+      void this.hangup();
+    }
+    this.incomingCall = null;
+    this.stopRingTone();
+    this.watchedRoomId = '';
+    this.activeRoomId = '';
+    this.participants = [];
+    this.roomPeersMap.clear();
+    this.closeAllPcs();
+    this.disconnectFirebaseSignaling();
+    this.emit();
+  }
+
   public async startMatchMicSession(roomId: string): Promise<void> {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       this.callStatusText = 'مطلوب اتصال بالإنترنت لتشغيل الميكروفون أونلاين';
@@ -1175,15 +1180,17 @@ class RtcCallManager {
     const matchChannel = `voice_${raw}`;
     if (this.inCall) return;
 
-    if (this.matchMicRoomId === matchChannel && (this.ws || this.sse)) {
+    if (
+      this.matchMicRoomId === matchChannel &&
+      this.signalingRoomId === sanitizeFirebaseKey(matchChannel)
+    ) {
       await this.ensureAutoMicActive().catch(() => {});
-      this.syncTracksToAllPeerJsConns();
-      this.connectMatchMicPeers();
-      this.startMatchMicReconciler();
+      this.syncTracksToAllPcs();
+      this.reconcileConnections();
       return;
     }
 
-    this.closeAllMeshPcs();
+    this.closeAllPcs();
     this.matchMicRoomId = matchChannel;
     this.watchedRoomId = matchChannel;
     this.activeRoomId = matchChannel;
@@ -1193,21 +1200,39 @@ class RtcCallManager {
     this.matchRemoteStreamsMap.clear();
     this.lastDialAttemptMap.clear();
 
-    // Acquire microphone track FIRST before joining/exchanging any WebRTC signaling!
+    // Acquire microphone track FIRST before exchanging any WebRTC signaling!
     await this.ensureAutoMicActive().catch(() => {});
     if (this.matchMicRoomId !== matchChannel || this.inCall) return;
 
-    this.connectSignaling(matchChannel);
+    this.connectFirebaseSignaling(matchChannel);
     await this.registerRoomPresence(matchChannel, false);
     if (this.matchMicRoomId !== matchChannel || this.inCall) return;
 
-    this.connectMatchMicPeers();
-    this.startMatchMicReconciler();
+    this.reconcileConnections();
     this.emit();
   }
 
-  private closeMeshPc(remotePeerId: string) {
-    const pc = this.meshPcs.get(remotePeerId);
+  public stopMatchMicSession() {
+    this.lastDialAttemptMap.clear();
+    this.closeAllPcs();
+    if (!this.matchMicRoomId) return;
+    this.matchMicRoomId = '';
+    this.watchedRoomId = '';
+    if (!this.inCall) {
+      this.activeRoomId = '';
+    }
+    this.participants = [];
+    this.roomPeersMap.clear();
+    this.matchRemoteStreamsMap.clear();
+    this.disconnectFirebaseSignaling();
+    this.emit();
+  }
+
+  // =========================================================================
+  // Native WebRTC Mesh PeerConnection Engine (with Metered TURN)
+  // =========================================================================
+  private closePc(remotePeerId: string) {
+    const pc = this.pcs.get(remotePeerId);
     if (pc) {
       try {
         pc.onicecandidate = null;
@@ -1216,114 +1241,109 @@ class RtcCallManager {
         pc.onconnectionstatechange = null;
         pc.close();
       } catch {}
-      this.meshPcs.delete(remotePeerId);
+      this.pcs.delete(remotePeerId);
     }
-    this.meshPendingIce.delete(remotePeerId);
-    this.meshMakingOffer.delete(remotePeerId);
+    this.pcModeMap.delete(remotePeerId);
+    this.pendingIce.delete(remotePeerId);
+    this.makingOffer.delete(remotePeerId);
+    this.remoteTrackStreams.delete(remotePeerId);
   }
 
-  private closeAllMeshPcs() {
-    Array.from(this.meshPcs.keys()).forEach((pid) => this.closeMeshPc(pid));
-    this.meshPcs.clear();
-    this.meshPendingIce.clear();
-    this.meshMakingOffer.clear();
+  private closeAllPcs() {
+    Array.from(this.pcs.keys()).forEach((pid) => this.closePc(pid));
+    this.pcs.clear();
+    this.pcModeMap.clear();
+    this.pendingIce.clear();
+    this.makingOffer.clear();
+    this.remoteTrackStreams.clear();
   }
 
-  private getLocalMatchAudioStream(): MediaStream | null {
-    if (this.micStream && this.micStream.getAudioTracks().some((t) => t.readyState === 'live')) {
-      return this.micStream;
-    }
-    return this.getOrCreateCallStream();
-  }
-
-  private createOrGetMeshPc(remotePeer: RtcParticipant): RTCPeerConnection {
-    const existing = this.meshPcs.get(remotePeer.peerId);
+  private createOrGetPc(
+    remotePeer: RtcParticipant,
+    mode: 'match' | 'call'
+  ): RTCPeerConnection {
+    const existing = this.pcs.get(remotePeer.peerId);
     if (
       existing &&
+      this.pcModeMap.get(remotePeer.peerId) === mode &&
       existing.signalingState !== 'closed' &&
       existing.connectionState !== 'closed' &&
       existing.iceConnectionState !== 'failed' &&
       existing.iceConnectionState !== 'closed'
     ) {
-      // Ensure local audio track is attached before any signaling
-      const localStream = this.getLocalMatchAudioStream();
-      if (localStream) {
-        const audioTrack = localStream.getAudioTracks().find((t) => t.readyState === 'live');
-        if (audioTrack) {
-          const sender = existing.getSenders().find((s) => s.track && s.track.kind === 'audio');
-          if (!sender) {
-            existing.addTrack(audioTrack, localStream);
-            this.tuneAudioSender(existing);
-          } else if (sender.track !== audioTrack) {
-            sender.replaceTrack(audioTrack).catch(() => {});
-            this.tuneAudioSender(existing);
-          }
-        }
-      }
+      this.attachLocalTracksToPc(existing, mode);
       return existing;
     }
 
     if (existing) {
-      this.closeMeshPc(remotePeer.peerId);
+      this.closePc(remotePeer.peerId);
     }
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    this.meshPcs.set(remotePeer.peerId, pc);
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    this.pcs.set(remotePeer.peerId, pc);
+    this.pcModeMap.set(remotePeer.peerId, mode);
 
-    // CRITICAL: Attach local audio track(s) to peer connection BEFORE exchanging SDP signaling
-    const localStream = this.getLocalMatchAudioStream();
-    if (localStream) {
-      const audioTracks = localStream.getAudioTracks().filter((t) => t.readyState === 'live');
-      if (audioTracks.length > 0) {
-        audioTracks.forEach((track) => {
-          pc.addTrack(track, localStream);
-        });
-        this.tuneAudioSender(pc);
-      } else {
-        try {
-          pc.addTransceiver('audio', { direction: 'sendrecv' });
-        } catch {}
-      }
-    } else {
-      try {
-        pc.addTransceiver('audio', { direction: 'sendrecv' });
-      } catch {}
-    }
+    // Attach local audio (and video in video calls) BEFORE exchanging SDP
+    this.attachLocalTracksToPc(pc, mode);
 
     pc.onicecandidate = (ev) => {
-      if (ev.candidate && this.matchMicRoomId) {
-        this.sendServerSignal(
-          this.matchMicRoomId,
+      const targetRoom = mode === 'match' ? this.matchMicRoomId : this.activeRoomId;
+      if (ev.candidate && targetRoom) {
+        this.sendFirebaseSignal(
+          targetRoom,
           remotePeer.peerId,
           'ice',
-          { candidate: ev.candidate.toJSON(), matchMic: true },
-          'audio'
+          { candidate: ev.candidate.toJSON() },
+          mode === 'match' ? 'audio' : this.callMode,
+          mode === 'match'
         ).catch(() => {});
       }
     };
 
     pc.ontrack = (ev) => {
       if (this.blockedPeersMap.has(remotePeer.peerId)) return;
-      const incomingStream =
-        ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+
+      let combinedRemote = this.remoteTrackStreams.get(remotePeer.peerId);
+      if (!combinedRemote) {
+        combinedRemote =
+          ev.streams && ev.streams[0] ? new MediaStream(ev.streams[0].getTracks()) : new MediaStream();
+      }
+      if (!combinedRemote.getTracks().some((t) => t.id === ev.track.id)) {
+        combinedRemote.addTrack(ev.track);
+      }
+      // Fresh MediaStream wrapper triggers React <video>/<audio> ref updates cleanly when video track arrives after audio
+      const freshStream = new MediaStream(combinedRemote.getTracks());
+      this.remoteTrackStreams.set(remotePeer.peerId, freshStream);
+
       const known = this.roomPeersMap.get(remotePeer.peerId) || remotePeer;
-      this.matchRemoteStreamsMap.set(remotePeer.peerId, {
+      const hasLiveVideo = freshStream.getVideoTracks().some((t) => t.readyState === 'live');
+      const entry: RemotePeerStream = {
         peerId: remotePeer.peerId,
         name: known.name || 'متسابق',
         avatar: known.avatar || '👤',
-        stream: incomingStream,
+        stream: freshStream,
         micOn: known.micOn ?? true,
-        camOn: false,
-        callMode: 'audio',
-      });
+        camOn: mode === 'call' ? (known.camOn || hasLiveVideo) : false,
+        callMode: mode === 'call' ? (hasLiveVideo || known.callMode === 'video' ? 'video' : 'audio') : 'audio',
+      };
+
+      if (mode === 'match') {
+        this.matchRemoteStreamsMap.set(remotePeer.peerId, entry);
+      } else {
+        this.remoteStreamsMap.set(remotePeer.peerId, entry);
+      }
       this.emit();
     };
 
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
+      if (state === 'connected' || state === 'completed') {
+        this.tuneAudioSender(pc);
+      }
       if (state === 'failed' || state === 'closed') {
-        if (this.meshPcs.get(remotePeer.peerId) === pc) {
-          this.closeMeshPc(remotePeer.peerId);
+        if (this.pcs.get(remotePeer.peerId) === pc) {
+          this.closePc(remotePeer.peerId);
+          this.remoteStreamsMap.delete(remotePeer.peerId);
           this.matchRemoteStreamsMap.delete(remotePeer.peerId);
           this.emit();
         }
@@ -1333,10 +1353,58 @@ class RtcCallManager {
     return pc;
   }
 
-  private async drainPendingMeshIce(remotePeerId: string, pc: RTCPeerConnection) {
-    const queue = this.meshPendingIce.get(remotePeerId);
+  private attachLocalTracksToPc(pc: RTCPeerConnection, mode: 'match' | 'call') {
+    const localStream = this.getLocalStreamForMode(mode);
+    const senders = pc.getSenders();
+
+    if (localStream) {
+      const audioTrack = localStream.getAudioTracks().find((t) => t.readyState === 'live');
+      if (audioTrack) {
+        const audioSender = senders.find((s) => s.track && s.track.kind === 'audio');
+        if (!audioSender) {
+          pc.addTrack(audioTrack, localStream);
+        } else if (audioSender.track !== audioTrack) {
+          audioSender.replaceTrack(audioTrack).catch(() => {});
+        }
+        this.tuneAudioSender(pc);
+      } else if (!senders.some((s) => s.track?.kind === 'audio')) {
+        try {
+          pc.addTransceiver('audio', { direction: 'sendrecv' });
+        } catch {}
+      }
+
+      if (mode === 'call') {
+        const videoTrack =
+          this.camOn && this.camStream
+            ? this.camStream.getVideoTracks().find((t) => t.readyState === 'live')
+            : null;
+        const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
+        if (videoTrack) {
+          if (!videoSender) {
+            pc.addTrack(videoTrack, localStream);
+          } else if (videoSender.track !== videoTrack) {
+            videoSender.replaceTrack(videoTrack).catch(() => {});
+          }
+        } else if (!videoSender && pc.getTransceivers().every((t) => t.receiver.track?.kind !== 'video')) {
+          try {
+            pc.addTransceiver('video', { direction: 'recvonly' });
+          } catch {}
+        }
+      }
+    } else {
+      try {
+        pc.addTransceiver('audio', { direction: 'sendrecv' });
+        if (mode === 'call') {
+          pc.addTransceiver('video', { direction: 'recvonly' });
+        }
+      } catch {}
+    }
+  }
+
+  private async drainPendingIce(remotePeerId: string, pc: RTCPeerConnection) {
+    const queue = this.pendingIce.get(remotePeerId);
     if (!queue || queue.length === 0) return;
-    this.meshPendingIce.delete(remotePeerId);
+    this.pendingIce.delete(remotePeerId);
     for (const cand of queue) {
       try {
         await pc.addIceCandidate(new RTCIceCandidate(cand));
@@ -1344,339 +1412,150 @@ class RtcCallManager {
     }
   }
 
-  private async initiateMeshOffer(remotePeer: RtcParticipant) {
-    if (!this.matchMicRoomId || this.inCall) return;
+  private async initiateOffer(remotePeer: RtcParticipant, mode: 'match' | 'call', forceRenegotiate = false) {
+    const targetRoom = mode === 'match' ? this.matchMicRoomId : this.activeRoomId;
+    if (!targetRoom) return;
+    if (mode === 'match' && this.inCall) return;
+    if (mode === 'call' && !this.inCall) return;
     if (this.blockedPeersMap.has(remotePeer.peerId)) return;
-    if (this.meshMakingOffer.get(remotePeer.peerId)) return;
+    if (this.makingOffer.get(remotePeer.peerId)) return;
 
-    this.meshMakingOffer.set(remotePeer.peerId, true);
+    this.makingOffer.set(remotePeer.peerId, true);
     try {
-      // Ensure local mic stream is ready before creating offer
-      if (!this.userDisabledMic && (!this.micStream || !this.micStream.getAudioTracks().some((t) => t.readyState === 'live'))) {
+      if (
+        !this.userDisabledMic &&
+        (!this.micStream || !this.micStream.getAudioTracks().some((t) => t.readyState === 'live'))
+      ) {
         await this.acquireMicrophone(true).catch(() => false);
       }
-      const pc = this.createOrGetMeshPc(remotePeer);
+      const pc = this.createOrGetPc(remotePeer, mode);
       if (pc.signalingState !== 'stable') return;
-      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
-      if (!this.matchMicRoomId || this.inCall) return;
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: mode === 'call',
+        iceRestart: forceRenegotiate,
+      });
+      if ((mode === 'match' && (!this.matchMicRoomId || this.inCall)) || (mode === 'call' && !this.inCall)) {
+        return;
+      }
       await pc.setLocalDescription(offer);
-      await this.sendServerSignal(
-        this.matchMicRoomId,
+      await this.sendFirebaseSignal(
+        targetRoom,
         remotePeer.peerId,
         'offer',
-        { sdp: pc.localDescription, matchMic: true },
-        'audio'
+        { sdp: pc.localDescription?.toJSON ? pc.localDescription.toJSON() : { type: offer.type, sdp: offer.sdp } },
+        mode === 'match' ? 'audio' : this.callMode,
+        mode === 'match'
       );
     } catch {
-      // Reconciler will retry cleanly
+      // Periodic reconciler will retry cleanly
     } finally {
-      this.meshMakingOffer.set(remotePeer.peerId, false);
+      this.makingOffer.set(remotePeer.peerId, false);
     }
   }
 
-  private startMatchMicReconciler() {
-    if (this.matchMicReconcileTimer) {
-      clearInterval(this.matchMicReconcileTimer);
-    }
-    this.matchMicReconcileTimer = setInterval(() => {
-      if (!this.matchMicRoomId || this.inCall) return;
+  private reconcileConnections(forceRetry = false) {
+    const nowMs = Date.now();
+    const mode: 'match' | 'call' | null = this.inCall
+      ? 'call'
+      : this.matchMicRoomId
+      ? 'match'
+      : null;
+    if (!mode) return;
 
-      try {
-        if (this.silentAudioCtx && this.silentAudioCtx.state === 'suspended') {
-          this.silentAudioCtx.resume().catch(() => {});
-        }
-        if (this.audioCtx && this.audioCtx.state === 'suspended') {
-          this.audioCtx.resume().catch(() => {});
-        }
-      } catch {}
-
-      if (!this.userDisabledMic) {
-        const hasLiveMic =
-          Boolean(this.micStream) &&
-          this.micStream!.getAudioTracks().some((t) => t.readyState === 'live');
-        if (!hasLiveMic) {
-          this.acquireMicrophone(true)
-            .then((ok) => {
-              if (ok) this.syncTracksToAllPeerJsConns();
-            })
-            .catch(() => {});
-        } else {
-          this.micStream!.getAudioTracks().forEach((t) => {
-            if (!t.enabled) t.enabled = true;
-          });
-          this.syncTracksToAllPeerJsConns();
-        }
-      }
-
-      // Clean up dead/stalled native WebRTC Mesh connections and reconnect automatically
-      const now = Date.now();
-      this.meshPcs.forEach((pc, pid) => {
-        const iceState = pc.iceConnectionState;
-        if (iceState === 'failed' || iceState === 'closed' || pc.connectionState === 'failed') {
-          this.closeMeshPc(pid);
-          this.matchRemoteStreamsMap.delete(pid);
-          this.emit();
-        }
-      });
-
-      this.connectMatchMicPeers(true, now);
-    }, 2200);
-  }
-
-  public stopMatchMicSession() {
-    if (this.matchMicReconcileTimer) {
-      clearInterval(this.matchMicReconcileTimer);
-      this.matchMicReconcileTimer = null;
-    }
-    this.lastDialAttemptMap.clear();
-    this.closeAllMeshPcs();
-    if (!this.matchMicRoomId) return;
-    const prevRoom = this.matchMicRoomId;
-    this.matchMicRoomId = '';
-    this.watchedRoomId = '';
-    if (!this.inCall) {
-      this.activeRoomId = '';
-    }
-    this.participants = [];
-    this.roomPeersMap.clear();
-    this.matchRemoteStreamsMap.clear();
-
-    this.mediaConns.forEach((mc) => {
-      try {
-        mc.close();
-      } catch {}
-    });
-    this.mediaConns.clear();
-    this.pendingMediaCalls.clear();
-    this.disconnectSignaling();
-
-    if (prevRoom) {
-      fetch(`/api/rooms/${encodeURIComponent(prevRoom)}/rtc/leave`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ peerId: this.peerId }),
-      }).catch(() => {});
-    }
-
-    this.dataConns.forEach((c) => {
-      try {
-        c.close();
-      } catch {}
-    });
-    this.dataConns.clear();
-    if (this.roomHostPeer) {
-      try {
-        this.roomHostPeer.destroy();
-      } catch {}
-      this.roomHostPeer = null;
-    }
-    this.hostGuestConns.clear();
-    this.emit();
-  }
-
-  private connectMatchMicPeers(forceRetry = false, nowMs = Date.now()) {
-    if (!this.matchMicRoomId || this.inCall) return;
     const seen = new Map<string, RtcParticipant>();
     this.roomPeersMap.forEach((p, id) => {
-      if (id !== this.peerId && !this.blockedPeersMap.has(id)) seen.set(id, p);
-    });
-    this.participants.forEach((p) => {
-      if (p.peerId !== this.peerId && !this.blockedPeersMap.has(p.peerId)) seen.set(p.peerId, p);
-    });
-    seen.forEach((p) => {
-      this.connectMatchMicPeer(p, forceRetry, nowMs);
-    });
-  }
-
-  private connectMatchMicPeer(remotePeer: RtcParticipant, forceRetry = false, nowMs = Date.now()) {
-    if (!this.matchMicRoomId || this.inCall) return;
-    if (!remotePeer.peerId || remotePeer.peerId === this.peerId || this.blockedPeersMap.has(remotePeer.peerId)) return;
-
-    const existing = this.meshPcs.get(remotePeer.peerId);
-    if (existing) {
-      const iceState = existing.iceConnectionState;
-      const hasStream = this.matchRemoteStreamsMap.has(remotePeer.peerId);
-      if (
-        (hasStream || iceState === 'connected' || iceState === 'completed' || iceState === 'checking') &&
-        iceState !== 'failed' &&
-        iceState !== 'closed'
-      ) {
-        return;
+      if (id !== this.peerId && !this.blockedPeersMap.has(id)) {
+        if (mode === 'match' || p.inCall) {
+          seen.set(id, p);
+        }
       }
-      if (!forceRetry) return;
+    });
+
+    seen.forEach((remotePeer) => {
+      const existing = this.pcs.get(remotePeer.peerId);
+      const streamMap = mode === 'match' ? this.matchRemoteStreamsMap : this.remoteStreamsMap;
+      if (existing && this.pcModeMap.get(remotePeer.peerId) === mode) {
+        const iceState = existing.iceConnectionState;
+        const hasStream = streamMap.has(remotePeer.peerId);
+        if (
+          (hasStream || iceState === 'connected' || iceState === 'completed' || iceState === 'checking') &&
+          iceState !== 'failed' &&
+          iceState !== 'closed'
+        ) {
+          return;
+        }
+        if (!forceRetry) return;
+        const lastDial = this.lastDialAttemptMap.get(remotePeer.peerId) || 0;
+        if (nowMs - lastDial < 5500) return;
+        this.closePc(remotePeer.peerId);
+      }
+
       const lastDial = this.lastDialAttemptMap.get(remotePeer.peerId) || 0;
-      if (nowMs - lastDial < 5500) return;
-      // Stale unconnected PC -> reset and retry
-      this.closeMeshPc(remotePeer.peerId);
-    }
+      if (nowMs - lastDial < 2500) return;
 
-    const lastDial = this.lastDialAttemptMap.get(remotePeer.peerId) || 0;
-    if (nowMs - lastDial < 2500) return;
-
-    if (this.peerId < remotePeer.peerId) {
-      this.lastDialAttemptMap.set(remotePeer.peerId, nowMs);
-      void this.initiateMeshOffer(remotePeer);
-    } else if (forceRetry) {
-      // Fallback if initiator hasn't reached us after 4s
-      const firstSeen = this.lastDialAttemptMap.get(`seen_${remotePeer.peerId}`) || nowMs;
-      if (!this.lastDialAttemptMap.has(`seen_${remotePeer.peerId}`)) {
-        this.lastDialAttemptMap.set(`seen_${remotePeer.peerId}`, nowMs);
-        return;
-      }
-      if (nowMs - firstSeen >= 4000) {
+      if (this.peerId < remotePeer.peerId) {
         this.lastDialAttemptMap.set(remotePeer.peerId, nowMs);
-        void this.initiateMeshOffer(remotePeer);
-      }
-    }
-  }
-
-  private syncDiscoveredParticipants(list: RtcParticipant[]) {
-    this.participants = list.filter((p) => !this.blockedPeersMap.has(p.peerId));
-    this.participants.forEach((p) => {
-      if (p.peerId !== this.peerId) {
-        this.roomPeersMap.set(p.peerId, p);
-        if (this.matchMicRoomId && !this.inCall) {
-          this.connectMatchMicPeer(p);
-        } else if (this.peerReady) {
-          this.connectDataPeer(p.peerId);
+        void this.initiateOffer(remotePeer, mode);
+      } else if (forceRetry) {
+        const seenKey = `seen_${remotePeer.peerId}`;
+        const firstSeen = this.lastDialAttemptMap.get(seenKey) || nowMs;
+        if (!this.lastDialAttemptMap.has(seenKey)) {
+          this.lastDialAttemptMap.set(seenKey, nowMs);
+          return;
+        }
+        if (nowMs - firstSeen >= 4000) {
+          this.lastDialAttemptMap.set(remotePeer.peerId, nowMs);
+          void this.initiateOffer(remotePeer, mode);
         }
       }
     });
   }
 
-  private connectSignaling(roomId: string) {
-    this.disconnectSignaling();
-    this.lastSignalSeq = 0;
+  private runPeriodicReconciler() {
+    if (!this.matchMicRoomId && !this.inCall) return;
 
     try {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${proto}//${window.location.host}/ws?roomId=${encodeURIComponent(roomId)}&peerId=${encodeURIComponent(this.peerId)}`;
-      const ws = new WebSocket(wsUrl);
-      this.ws = ws;
-      ws.onmessage = (evt) => {
-        try {
-          const parsed = JSON.parse(evt.data);
-          this.handleServerEvent(parsed.event, parsed.data);
-        } catch {}
-      };
-      ws.onerror = () => {};
+      if (this.silentAudioCtx && this.silentAudioCtx.state === 'suspended') {
+        this.silentAudioCtx.resume().catch(() => {});
+      }
+      if (this.audioCtx && this.audioCtx.state === 'suspended') {
+        this.audioCtx.resume().catch(() => {});
+      }
     } catch {}
 
-    try {
-      const es = new EventSource(`/api/rooms/${encodeURIComponent(roomId)}/events`);
-      this.sse = es;
-      es.onmessage = (evt) => {
-        try {
-          const parsed = JSON.parse(evt.data);
-          this.handleServerEvent(parsed.event, parsed.data);
-        } catch {}
-      };
-    } catch {}
-
-    // Keep room presence alive even before a voice/video call starts
-    this.presenceTimer = setInterval(() => {
-      const target = this.inCall ? this.activeRoomId : this.watchedRoomId;
-      if (!target) return;
-      fetch(`/api/rooms/${encodeURIComponent(target)}/rtc/media`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          peerId: this.peerId,
-          name: this.profileName,
-          avatar: this.profileAvatar,
-          micOn: this.micOn,
-          camOn: this.camOn,
-          callMode: this.callMode,
-          inCall: this.inCall,
-        }),
-      }).catch(() => {});
-    }, 5000);
-
-    this.pollTimer = setInterval(() => {
-      const targetRoom = this.inCall ? this.activeRoomId : this.watchedRoomId;
-      if (!targetRoom) return;
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try {
-          this.ws.send(JSON.stringify({ event: 'rtc:ping', roomId: targetRoom }));
-        } catch {}
+    if (!this.userDisabledMic) {
+      const hasLiveMic =
+        Boolean(this.micStream) &&
+        this.micStream!.getAudioTracks().some((t) => t.readyState === 'live');
+      if (!hasLiveMic) {
+        this.acquireMicrophone(true)
+          .then((ok) => {
+            if (ok) this.syncTracksToAllPcs();
+          })
+          .catch(() => {});
+      } else {
+        this.micStream!.getAudioTracks().forEach((t) => {
+          if (!t.enabled) t.enabled = true;
+        });
       }
-      fetch(
-        `/api/rooms/${encodeURIComponent(targetRoom)}/rtc/state?peerId=${encodeURIComponent(this.peerId)}&since=${this.lastSignalSeq}&ping=1`
-      )
-        .then((r) => r.json())
-        .then((d) => {
-          if (!d || !d.success) return;
-          if (Array.isArray(d.participants)) {
-            this.syncDiscoveredParticipants(d.participants as RtcParticipant[]);
-          }
-          if (Array.isArray(d.signals)) {
-            d.signals.forEach((sig: { id: string; seq: number }) => {
-              if (sig.seq > this.lastSignalSeq) this.lastSignalSeq = sig.seq;
-              this.handleIncomingSignal(sig as never);
-            });
-          }
-          this.emit();
-        })
-        .catch(() => {});
-    }, 1500);
-  }
+    }
 
-  private disconnectSignaling() {
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {}
-      this.ws = null;
-    }
-    if (this.sse) {
-      try {
-        this.sse.close();
-      } catch {}
-      this.sse = null;
-    }
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
-    if (this.presenceTimer) {
-      clearInterval(this.presenceTimer);
-      this.presenceTimer = null;
-    }
-  }
+    this.pcs.forEach((pc, pid) => {
+      const iceState = pc.iceConnectionState;
+      if (iceState === 'failed' || iceState === 'closed' || pc.connectionState === 'failed') {
+        this.closePc(pid);
+        this.remoteStreamsMap.delete(pid);
+        this.matchRemoteStreamsMap.delete(pid);
+        this.emit();
+      }
+    });
 
-  private handleServerEvent(eventName: string, data: unknown) {
-    if (!data || typeof data !== 'object') return;
-    const d = data as Record<string, unknown>;
-    if (
-      eventName === 'rtc:welcome' ||
-      eventName === 'rtc:peer_joined' ||
-      eventName === 'rtc:peer_left' ||
-      eventName === 'rtc:media_state'
-    ) {
-      if (Array.isArray(d.participants)) {
-        this.syncDiscoveredParticipants(d.participants as RtcParticipant[]);
-      }
-      if (eventName === 'rtc:peer_left' && typeof d.peerId === 'string') {
-        this.roomPeersMap.delete(d.peerId);
-        this.removeRemotePeer(d.peerId);
-      }
-      if (eventName === 'rtc:media_state' && d.participant && typeof d.participant === 'object') {
-        const p = d.participant as RtcParticipant;
-        const remote = this.remoteStreamsMap.get(p.peerId);
-        if (remote) {
-          remote.micOn = p.micOn;
-          remote.camOn = p.camOn;
-          remote.callMode = p.callMode;
-        }
-      }
-      this.emit();
-    } else if (eventName === 'rtc:signal') {
-      this.handleIncomingSignal(d as never);
-    }
+    this.reconcileConnections(true);
   }
 
   // =========================================================================
-  // PeerJS Voice & Video Call Management (Audio / Video Calls)
+  // Private Voice & Video Calls (Firebase RTDB + Metered TURN WebRTC)
   // =========================================================================
   public async startCall(roomId: string, mode: CallMode): Promise<boolean> {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
@@ -1686,6 +1565,10 @@ class RtcCallManager {
     }
     const cleanRoom = (roomId || '').trim();
     if (!cleanRoom) return false;
+
+    this.unlockAudioContextInGesture();
+    this.closeAllPcs();
+    this.matchMicRoomId = '';
     this.activeRoomId = cleanRoom;
     this.watchedRoomId = cleanRoom;
     this.callMode = mode;
@@ -1694,64 +1577,37 @@ class RtcCallManager {
     this.stopRingTone();
     this.callStatusText =
       mode === 'video'
-        ? 'جاري تشغيل مكالمة الفيديو عبر PeerJS...'
-        : 'جاري بدء الاتصال الصوتي عبر PeerJS...';
+        ? 'جاري تشغيل مكالمة الفيديو المباشرة...'
+        : 'جاري بدء الاتصال الصوتي المباشر...';
     this.emit();
 
-    this.ensurePeerJsInitialized(cleanRoom);
-    await this.acquireMicrophone(!this.userDisabledMic);
-
+    // Android WebView optimization: acquire audio+video in ONE getUserMedia call inside user tap!
     if (mode === 'video') {
-      await this.acquireCamera(this.facingMode);
+      await this.acquireCombinedAudioVideo(this.facingMode);
     } else {
       this.stopCamera();
+      await this.acquireMicrophone(!this.userDisabledMic);
     }
 
-    this.connectSignaling(cleanRoom);
+    this.connectFirebaseSignaling(cleanRoom);
     this.startCallTimer();
     await this.registerRoomPresence(cleanRoom, true);
 
-    // Answer any pending incoming PeerJS MediaConnection first
-    this.pendingMediaCalls.forEach((mc, pid) => {
-      if (!this.blockedPeersMap.has(pid)) {
-        this.answerMediaConnection(mc);
-      } else {
-        try {
-          mc.close();
-        } catch {}
-      }
-    });
-    this.pendingMediaCalls.clear();
+    // Connect to all non-blocked participants already inside the call
+    this.reconcileConnections();
 
-    // Call all non-blocked participants already inside the call via PeerJS
-    const snap = this.getSnapshot();
-    const activeOthers = snap.participants.filter(
-      (p) => p.peerId !== this.peerId && p.inCall && !this.blockedPeersMap.has(p.peerId)
-    );
-    activeOthers.forEach((other) => {
-      if (!this.mediaConns.has(other.peerId)) {
-        this.callPeerViaPeerJS(other);
-      }
-    });
-
-    // Notify room via PeerJS DataConnections & server ring signal
-    this.broadcastDataToPeers({
-      type: 'ring',
-      roomId: cleanRoom,
-      fromId: this.peerId,
-      fromName: this.profileName,
-      fromAvatar: this.profileAvatar,
-      callMode: mode,
-    });
-    await this.sendServerSignal(
+    // Ring everyone in the room who hasn't joined the call yet
+    await this.sendFirebaseSignal(
       cleanRoom,
       undefined,
       'ring',
       { name: this.profileName, avatar: this.profileAvatar },
-      mode
+      mode,
+      false
     );
 
-    this.callStatusText = mode === 'video' ? 'مكالمة فيديو نشطة (PeerJS)' : 'اتصال صوتي نشط (PeerJS)';
+    this.callStatusText =
+      mode === 'video' ? 'مكالمة فيديو نشطة (TURN)' : 'اتصال صوتي نشط (TURN)';
     this.emit();
     return true;
   }
@@ -1769,215 +1625,8 @@ class RtcCallManager {
     const { roomId, fromId } = this.incomingCall;
     this.incomingCall = null;
     this.stopRingTone();
-
-    const pendingMc = this.pendingMediaCalls.get(fromId);
-    if (pendingMc) {
-      try {
-        pendingMc.close();
-      } catch {}
-      this.pendingMediaCalls.delete(fromId);
-    }
-
-    const dc = this.dataConns.get(fromId);
-    if (dc && dc.open) {
-      try {
-        dc.send({ type: 'reject', roomId, fromId: this.peerId, fromName: this.profileName });
-      } catch {}
-    }
-    this.sendServerSignal(roomId, fromId, 'reject', {});
+    this.sendFirebaseSignal(roomId, fromId, 'reject', {}).catch(() => {});
     this.emit();
-  }
-
-  private callPeerViaPeerJS(remotePeer: RtcParticipant, isMatchMic = false) {
-    if (!this.peer || this.peer.destroyed || !this.peerReady) return;
-    const stream = isMatchMic ? this.getOrCreateCallStream() : (this.combinedStream || this.getOrCreateCallStream());
-    if (!stream || this.blockedPeersMap.has(remotePeer.peerId)) return;
-
-    const existing = this.mediaConns.get(remotePeer.peerId);
-    if (existing) {
-      try {
-        existing.close();
-      } catch {}
-      this.mediaConns.delete(remotePeer.peerId);
-    }
-
-    try {
-      const mediaConn = this.peer.call(remotePeer.peerId, stream, {
-        metadata: {
-          roomId: this.matchMicRoomId || this.activeRoomId || this.watchedRoomId,
-          matchMic: isMatchMic || Boolean(this.matchMicRoomId && !this.inCall),
-          name: this.profileName,
-          avatar: this.profileAvatar,
-          callMode: isMatchMic ? 'audio' : this.callMode,
-          micOn: this.micOn,
-          camOn: isMatchMic ? false : this.camOn,
-        },
-      });
-      if (!mediaConn) return;
-      this.bindMediaConnection(mediaConn, remotePeer, isMatchMic || Boolean(this.matchMicRoomId && !this.inCall));
-    } catch {}
-  }
-
-  private handleIncomingPeerMediaCall(mediaConn: MediaConnection) {
-    const remoteId = mediaConn.peer;
-    if (this.blockedPeersMap.has(remoteId)) {
-      try {
-        mediaConn.close();
-      } catch {}
-      return;
-    }
-
-    const meta = (mediaConn.metadata || {}) as Record<string, unknown>;
-    const callerInfo: RtcParticipant = {
-      peerId: remoteId,
-      name: String(meta.name || 'متصل'),
-      avatar: String(meta.avatar || '👤'),
-      callMode: meta.callMode === 'video' ? 'video' : 'audio',
-      micOn: typeof meta.micOn === 'boolean' ? meta.micOn : true,
-      camOn: typeof meta.camOn === 'boolean' ? meta.camOn : false,
-      inCall: !meta.matchMic,
-    };
-
-    // Match Voice Chat (Audio-Only inside active 1v1 Duel without triggering call modal or pausing questions)
-    if (meta.matchMic === true && this.matchMicRoomId && String(meta.roomId || '') === this.matchMicRoomId && !this.inCall) {
-      this.answerMediaConnection(mediaConn, callerInfo, true);
-      return;
-    }
-
-    if (this.inCall) {
-      this.answerMediaConnection(mediaConn, callerInfo, false);
-    } else {
-      this.pendingMediaCalls.set(remoteId, mediaConn);
-      if (!this.incomingCall && (this.watchedRoomId || meta.roomId)) {
-        this.incomingCall = {
-          roomId: String(meta.roomId || this.watchedRoomId),
-          fromId: remoteId,
-          fromName: callerInfo.name,
-          fromAvatar: callerInfo.avatar,
-          callMode: callerInfo.callMode,
-          timestamp: Date.now(),
-        };
-        this.startRingTone();
-        this.emit();
-      }
-    }
-  }
-
-  private answerMediaConnection(mediaConn: MediaConnection, callerInfo?: RtcParticipant, isMatchMic = false) {
-    try {
-      const stream = isMatchMic ? this.getOrCreateCallStream() : (this.combinedStream || this.getOrCreateCallStream());
-      mediaConn.answer(stream || undefined);
-      this.bindMediaConnection(mediaConn, callerInfo, isMatchMic);
-    } catch {}
-  }
-
-  private bindMediaConnection(mediaConn: MediaConnection, info?: RtcParticipant, isMatchMic = false) {
-    const remotePeerId = mediaConn.peer;
-    const prev = this.mediaConns.get(remotePeerId);
-    if (prev && prev !== mediaConn) {
-      try {
-        prev.close();
-      } catch {}
-    }
-    this.mediaConns.set(remotePeerId, mediaConn);
-
-    mediaConn.on('stream', (stream) => {
-      if (this.blockedPeersMap.has(remotePeerId)) {
-        try {
-          mediaConn.close();
-        } catch {}
-        return;
-      }
-      const pInfo =
-        this.participants.find((p) => p.peerId === remotePeerId) ||
-        this.roomPeersMap.get(remotePeerId) ||
-        info;
-      const entry: RemotePeerStream = {
-        peerId: remotePeerId,
-        name: pInfo?.name || 'متصل',
-        avatar: pInfo?.avatar || '👤',
-        stream,
-        micOn: pInfo?.micOn ?? true,
-        camOn: isMatchMic ? false : (pInfo?.camOn ?? stream.getVideoTracks().length > 0),
-        callMode: isMatchMic ? 'audio' : (pInfo?.callMode ?? (stream.getVideoTracks().length > 0 ? 'video' : 'audio')),
-      };
-
-      if (isMatchMic || (this.matchMicRoomId && !this.inCall)) {
-        this.matchRemoteStreamsMap.set(remotePeerId, entry);
-      } else {
-        this.remoteStreamsMap.set(remotePeerId, entry);
-      }
-      this.emit();
-    });
-
-    mediaConn.on('close', () => {
-      if (this.mediaConns.get(remotePeerId) === mediaConn) {
-        this.mediaConns.delete(remotePeerId);
-        this.remoteStreamsMap.delete(remotePeerId);
-        this.matchRemoteStreamsMap.delete(remotePeerId);
-        this.emit();
-      }
-    });
-
-    mediaConn.on('error', () => {
-      if (this.mediaConns.get(remotePeerId) === mediaConn) {
-        this.mediaConns.delete(remotePeerId);
-      }
-    });
-
-    try {
-      const pc = mediaConn.peerConnection;
-      if (pc) {
-        this.tuneAudioSender(pc);
-        pc.addEventListener('iceconnectionstatechange', () => {
-          const st = pc.iceConnectionState;
-          if (st === 'connected' || st === 'completed') {
-            this.tuneAudioSender(pc);
-          }
-          if ((st === 'failed' || st === 'closed') && this.mediaConns.get(remotePeerId) === mediaConn) {
-            this.mediaConns.delete(remotePeerId);
-            this.matchRemoteStreamsMap.delete(remotePeerId);
-            this.remoteStreamsMap.delete(remotePeerId);
-            this.emit();
-          }
-        });
-      }
-    } catch {}
-  }
-
-  private async acquireCamera(facing: 'user' | 'environment'): Promise<boolean> {
-    try {
-      this.stopCamera();
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: facing,
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-        },
-        audio: false,
-      });
-      this.camStream = stream;
-      this.camOn = true;
-      this.facingMode = facing;
-      this.rebuildCombinedStream();
-      this.syncTracksToAllPeerJsConns();
-      this.emit();
-      return true;
-    } catch {
-      this.camOn = false;
-      this.callStatusText = 'تعذر تشغيل الكاميرا — مستمر بالصوت';
-      this.emit();
-      return false;
-    }
-  }
-
-  private stopCamera() {
-    if (this.camStream) {
-      this.camStream.getTracks().forEach((t) => t.stop());
-      this.camStream = null;
-    }
-    this.camOn = false;
-    this.rebuildCombinedStream();
   }
 
   public async toggleCamera(): Promise<void> {
@@ -1985,25 +1634,26 @@ class RtcCallManager {
     if (this.camOn) {
       this.stopCamera();
       this.callMode = 'audio';
+      this.syncTracksToAllPcs();
     } else {
       const ok = await this.acquireCamera(this.facingMode);
       if (ok) {
         this.callMode = 'video';
-        // Renegotiate via fresh PeerJS call so remote side renders video track immediately
-        const snap = this.getSnapshot();
-        for (const [remotePeerId] of this.mediaConns.entries()) {
-          const p = snap.participants.find((x) => x.peerId === remotePeerId);
-          this.callPeerViaPeerJS(
-            p || {
+        const addedNew = this.syncTracksToAllPcs();
+        if (addedNew) {
+          // Renegotiate SDP so remote devices immediately receive the newly added video track
+          this.pcs.forEach((_pc, remotePeerId) => {
+            const p = this.roomPeersMap.get(remotePeerId) || {
               peerId: remotePeerId,
               name: 'متصل',
               avatar: '👤',
-              callMode: 'video',
+              callMode: 'video' as CallMode,
               micOn: true,
               camOn: false,
               inCall: true,
-            }
-          );
+            };
+            void this.initiateOffer(p, 'call', false);
+          });
         }
       }
     }
@@ -2023,30 +1673,9 @@ class RtcCallManager {
   }
 
   private async publishMediaState() {
-    if (!this.activeRoomId) return;
-    const participantPayload: RtcParticipant = {
-      peerId: this.peerId,
-      name: this.profileName,
-      avatar: this.profileAvatar,
-      micOn: this.micOn,
-      camOn: this.camOn,
-      callMode: this.callMode,
-      inCall: this.inCall,
-    };
-
-    this.broadcastDataToPeers({
-      type: 'media_state',
-      roomId: this.activeRoomId,
-      participant: participantPayload,
-    });
-
-    try {
-      await fetch(`/api/rooms/${encodeURIComponent(this.activeRoomId)}/rtc/media`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(participantPayload),
-      });
-    } catch {}
+    const targetRoom = this.activeRoomId || this.watchedRoomId;
+    if (!targetRoom) return;
+    await this.registerRoomPresence(targetRoom, this.inCall);
   }
 
   public async hangup() {
@@ -2055,24 +1684,13 @@ class RtcCallManager {
     this.callStatusText = null;
     this.stopCallTimer();
     this.stopCamera();
-
-    this.mediaConns.forEach((mc) => {
-      try {
-        mc.close();
-      } catch {}
-    });
-    this.mediaConns.clear();
-    this.pendingMediaCalls.forEach((mc) => {
-      try {
-        mc.close();
-      } catch {}
-    });
-    this.pendingMediaCalls.clear();
+    this.closeAllPcs();
     this.remoteStreamsMap.clear();
 
     if (roomToLeave) {
-      this.broadcastDataToPeers({ type: 'hangup', roomId: roomToLeave, fromId: this.peerId });
-      this.sendServerSignal(roomToLeave, undefined, 'hangup', {}, this.callMode).catch(() => {});
+      this.sendFirebaseSignal(roomToLeave, undefined, 'hangup', {}, this.callMode, false).catch(
+        () => {}
+      );
       await this.registerRoomPresence(roomToLeave, false);
     }
 
@@ -2097,43 +1715,29 @@ class RtcCallManager {
   }
 
   private removeRemotePeer(remotePeerId: string) {
-    this.closeMeshPc(remotePeerId);
-    const mc = this.mediaConns.get(remotePeerId);
-    if (mc) {
-      try {
-        mc.close();
-      } catch {}
-      this.mediaConns.delete(remotePeerId);
-    }
+    this.closePc(remotePeerId);
     this.remoteStreamsMap.delete(remotePeerId);
     this.matchRemoteStreamsMap.delete(remotePeerId);
     this.emit();
   }
 
-  private async handleIncomingSignal(sig: {
-    id: string;
-    seq?: number;
-    fromId: string;
-    fromName: string;
-    fromAvatar: string;
-    toId?: string;
-    type: string;
-    callMode?: CallMode;
-    payload?: unknown;
-  }) {
+  private async handleIncomingSignal(sig: RtcSignalPayload) {
     if (!sig || !sig.fromId || sig.fromId === this.peerId) return;
     if (this.blockedPeersMap.has(sig.fromId)) return;
     if (sig.toId && sig.toId !== this.peerId) return;
     if (sig.id && this.processedSignalIds.has(sig.id)) return;
     if (sig.id) this.processedSignalIds.add(sig.id);
-    if (this.processedSignalIds.size > 300) {
+    if (this.processedSignalIds.size > 400) {
       const first = this.processedSignalIds.values().next().value;
       if (first) this.processedSignalIds.delete(first);
     }
 
-    // Native WebRTC Mesh SDP Offer / Answer / ICE for 1v1 & 4-Player Match Voice
+    const mode: 'match' | 'call' = sig.matchMic ? 'match' : this.inCall ? 'call' : 'match';
+
     if (sig.type === 'offer') {
-      if (!this.matchMicRoomId || this.inCall) return;
+      if (mode === 'match' && (!this.matchMicRoomId || this.inCall)) return;
+      if (mode === 'call' && !this.inCall) return;
+
       const p = (sig.payload || {}) as { sdp?: RTCSessionDescriptionInit };
       if (!p.sdp) return;
 
@@ -2141,75 +1745,81 @@ class RtcCallManager {
         peerId: sig.fromId,
         name: sig.fromName || 'متسابق',
         avatar: sig.fromAvatar || '👤',
-        callMode: 'audio',
+        callMode: sig.callMode || 'audio',
         micOn: true,
-        camOn: false,
-        inCall: false,
+        camOn: sig.callMode === 'video',
+        inCall: mode === 'call',
       };
       this.roomPeersMap.set(sig.fromId, remoteInfo);
 
-      const existing = this.meshPcs.get(sig.fromId);
+      const existing = this.pcs.get(sig.fromId);
       const isPolite = this.peerId > sig.fromId;
       const offerCollision =
-        Boolean(this.meshMakingOffer.get(sig.fromId)) ||
+        Boolean(this.makingOffer.get(sig.fromId)) ||
         (existing !== undefined && existing.signalingState !== 'stable');
       if (offerCollision && !isPolite) {
         return;
       }
       if (offerCollision && isPolite && existing) {
-        this.closeMeshPc(sig.fromId);
+        this.closePc(sig.fromId);
       }
 
       try {
-        // Ensure local audio track is acquired and attached BEFORE answering!
-        if (!this.userDisabledMic && (!this.micStream || !this.micStream.getAudioTracks().some((t) => t.readyState === 'live'))) {
+        if (
+          !this.userDisabledMic &&
+          (!this.micStream || !this.micStream.getAudioTracks().some((t) => t.readyState === 'live'))
+        ) {
           await this.acquireMicrophone(true).catch(() => false);
         }
-        const pc = this.createOrGetMeshPc(remoteInfo);
+        const pc = this.createOrGetPc(remoteInfo, mode);
         await pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
-        await this.drainPendingMeshIce(sig.fromId, pc);
+        await this.drainPendingIce(sig.fromId, pc);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        await this.sendServerSignal(
-          this.matchMicRoomId,
+        const targetRoom = mode === 'match' ? this.matchMicRoomId : this.activeRoomId;
+        await this.sendFirebaseSignal(
+          targetRoom,
           sig.fromId,
           'answer',
-          { sdp: pc.localDescription, matchMic: true },
-          'audio'
+          {
+            sdp: pc.localDescription?.toJSON
+              ? pc.localDescription.toJSON()
+              : { type: answer.type, sdp: answer.sdp },
+          },
+          mode === 'match' ? 'audio' : this.callMode,
+          mode === 'match'
         );
       } catch {
-        this.closeMeshPc(sig.fromId);
+        this.closePc(sig.fromId);
       }
       return;
     }
 
     if (sig.type === 'answer') {
-      if (!this.matchMicRoomId || this.inCall) return;
       const p = (sig.payload || {}) as { sdp?: RTCSessionDescriptionInit };
       if (!p.sdp) return;
-      const pc = this.meshPcs.get(sig.fromId);
+      const pc = this.pcs.get(sig.fromId);
       if (!pc || pc.signalingState !== 'have-local-offer') return;
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
-        await this.drainPendingMeshIce(sig.fromId, pc);
+        await this.drainPendingIce(sig.fromId, pc);
       } catch {
-        this.closeMeshPc(sig.fromId);
+        this.closePc(sig.fromId);
       }
       return;
     }
 
     if (sig.type === 'ice') {
-      if (!this.matchMicRoomId || this.inCall) return;
       const p = (sig.payload || {}) as { candidate?: RTCIceCandidateInit };
       if (!p.candidate) return;
-      const pc = this.meshPcs.get(sig.fromId);
+      const pc = this.pcs.get(sig.fromId);
       if (pc && pc.remoteDescription) {
         pc.addIceCandidate(new RTCIceCandidate(p.candidate)).catch(() => {});
       } else {
-        const q = this.meshPendingIce.get(sig.fromId) || [];
-        if (q.length < 40) {
+        const q = this.pendingIce.get(sig.fromId) || [];
+        if (q.length < 50) {
           q.push(p.candidate);
-          this.meshPendingIce.set(sig.fromId, q);
+          this.pendingIce.set(sig.fromId, q);
         }
       }
       return;
@@ -2245,39 +1855,6 @@ class RtcCallManager {
       this.callStatusText = `${sig.fromName || 'الطرف الآخر'} رفض المكالمة`;
       this.emit();
     }
-  }
-
-  private async sendServerSignal(
-    roomId: string,
-    toId: string | undefined,
-    type: 'offer' | 'answer' | 'ice' | 'ring' | 'accept' | 'reject' | 'hangup' | 'media_state',
-    payload: unknown,
-    callMode?: CallMode
-  ) {
-    const room = roomId || this.activeRoomId || this.watchedRoomId;
-    if (!room) return;
-    const data = {
-      fromId: this.peerId,
-      fromName: this.profileName,
-      fromAvatar: this.profileAvatar,
-      toId,
-      type,
-      callMode: callMode || this.callMode,
-      payload,
-    };
-
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      try {
-        this.ws.send(JSON.stringify({ event: 'rtc:signal', roomId: room, data }));
-        return;
-      } catch {}
-    }
-
-    await fetch(`/api/rooms/${encodeURIComponent(room)}/rtc/signal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    }).catch(() => {});
   }
 
   private startRingTone() {

@@ -71,6 +71,10 @@ import {
   normalizePrivateRoomCode,
   rtcCallManager,
 } from './services/rtcCallManager';
+import {
+  checkFirebaseConnectivity,
+  initFirebaseAnalyticsIfOnline,
+} from './services/firebaseClient';
 
 const CLASSIC_CATEGORIES: { key: string; ar: string; en: string; icon: string }[] = [
   { key: 'all', ar: 'شامل (الكل)', en: 'All', icon: '🌟' },
@@ -319,7 +323,7 @@ export default function App() {
   }, [lang]);
 
   // Only check internet connectivity when the player explicitly chooses Online / 1v1 Duel / Call Room.
-  // Never runs on app open, Home Lobby, or "Play vs Computer".
+  // Frontend-only Firebase RTDB connectivity check (zero local /api/* dependency for Cloudflare Pages).
   const verifyInternetBeforeOnline = async (onOnline: () => void) => {
     if (isCheckingOnline) return;
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
@@ -328,14 +332,9 @@ export default function App() {
     }
     setIsCheckingOnline(true);
     try {
-      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const timer = ctrl ? setTimeout(() => ctrl.abort(), 2500) : null;
-      const res = await fetch(`/api/app-meta?ping=1&t=${Date.now()}`, {
-        cache: 'no-store',
-        signal: ctrl?.signal,
-      });
-      if (timer) clearTimeout(timer);
-      if (!res.ok) {
+      initFirebaseAnalyticsIfOnline();
+      const onlineOk = await checkFirebaseConnectivity(3200);
+      if (!onlineOk) {
         setIsOfflineModalOpen(true);
         return;
       }

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Flag, X, CheckCircle2, ShieldAlert, Ban } from 'lucide-react';
 import { Language } from '../types/game';
+import { savePlayerReportToFirebase } from '../services/firebaseRoomService';
 
 export interface ReportTarget {
   id: string;
@@ -96,15 +97,7 @@ export async function submitPlayerReport(params: {
   } catch {}
 
   try {
-    const res = await fetch('/api/reports', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(record),
-    });
-    const data = await res.json();
-    if (data && data.reportId) {
-      record.id = data.reportId;
-    }
+    await savePlayerReportToFirebase(record);
   } catch {}
 
   return record;

@@ -174,10 +174,13 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang }) => {
   }, []);
 
   useEffect(() => {
-    if (localVideoRef.current && snap.localStream && snap.camOn) {
-      if (localVideoRef.current.srcObject !== snap.localStream) {
-        localVideoRef.current.srcObject = snap.localStream;
+    const el = localVideoRef.current;
+    if (el && snap.localStream && snap.camOn) {
+      if (el.srcObject !== snap.localStream) {
+        el.srcObject = snap.localStream;
       }
+      el.muted = true;
+      el.play().catch(() => {});
     }
   }, [snap.localStream, snap.camOn, videoExpanded, snap.inCall]);
 
@@ -405,6 +408,7 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang }) => {
                   autoPlay
                   playsInline
                   muted
+                  onLoadedMetadata={(e) => e.currentTarget.play().catch(() => {})}
                   className={`w-full h-full object-cover ${snap.facingMode === 'user' ? 'scale-x-[-1]' : ''}`}
                 />
               ) : (

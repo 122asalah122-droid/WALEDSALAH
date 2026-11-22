@@ -28,6 +28,11 @@ import {
 } from '../services/rtcCallManager';
 import { sounds } from '../utils/soundEffects';
 import { ReportPlayerModal, ReportTarget } from './ReportPlayerModal';
+import {
+  subscribeRoomMessages,
+  sendRoomMessage,
+  deleteRoomMessage,
+} from '../services/firebaseRoomService';
 
 interface RoomsCallModalProps {
   isOpen: boolean;
@@ -76,73 +81,27 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
     rtcCallManager.watchRoom(selectedRoomId);
   }, [isOpen, selectedRoomId]);
 
-  // Direct PeerJS chat listener + Backend room chat sync
+  // Real-time Firebase Realtime Database room chat sync (no local server required)
   useEffect(() => {
     if (!isOpen || !selectedRoomId) return;
 
-    const unsubPeerChat = rtcCallManager.subscribeChat((roomId, msg, deletedId) => {
-      if (roomId !== selectedRoomId) return;
-      if (deletedId) {
-        setMessages((prev) => prev.filter((m) => m.id !== deletedId));
-        return;
-      }
-      if (msg && msg.id) {
-        setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
-        if (msg.senderId !== mySenderId) {
+    let initialLoaded = false;
+    let prevCount = 0;
+
+    const unsub = subscribeRoomMessages(selectedRoomId, (incoming) => {
+      if (initialLoaded && incoming.length > prevCount) {
+        const newest = incoming[incoming.length - 1];
+        if (newest && newest.senderId !== mySenderId) {
           sounds.playChatMessage();
         }
       }
+      initialLoaded = true;
+      prevCount = incoming.length;
+      setMessages(incoming);
     });
 
-    let cancelled = false;
-    const fetchMessages = async () => {
-      try {
-        const res = await fetch(`/api/rooms/${encodeURIComponent(selectedRoomId)}/messages`);
-        if (!res.ok) return;
-        const data = await res.json();
-        if (!cancelled && data && Array.isArray(data.messages)) {
-          setMessages((prev) => {
-            const byId = new Map<string, ChatMessage>();
-            (data.messages as ChatMessage[]).forEach((m) => byId.set(m.id, m));
-            // Keep any freshly received P2P messages not yet mirrored on HTTP
-            prev.forEach((m) => {
-              if (!byId.has(m.id) && m.id.startsWith('m_')) {
-                byId.set(m.id, m);
-              }
-            });
-            return Array.from(byId.values());
-          });
-        }
-      } catch {}
-    };
-
-    fetchMessages();
-    const poll = setInterval(fetchMessages, 1800);
-
-    let es: EventSource | null = null;
-    try {
-      es = new EventSource(`/api/rooms/${encodeURIComponent(selectedRoomId)}/events`);
-      es.onmessage = (evt) => {
-        try {
-          const parsed = JSON.parse(evt.data);
-          if (parsed.event === 'chat:message' && parsed.data?.message) {
-            const msg = parsed.data.message as ChatMessage;
-            setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
-            if (msg.senderId !== mySenderId) {
-              sounds.playChatMessage();
-            }
-          } else if (parsed.event === 'chat:deleted' && parsed.data?.messageId) {
-            setMessages((prev) => prev.filter((m) => m.id !== parsed.data.messageId));
-          }
-        } catch {}
-      };
-    } catch {}
-
     return () => {
-      cancelled = true;
-      unsubPeerChat();
-      clearInterval(poll);
-      if (es) es.close();
+      unsub();
     };
   }, [isOpen, selectedRoomId, mySenderId]);
 
@@ -155,17 +114,15 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
   if (!isOpen) return null;
 
   const privateShareUrl = (() => {
-    const PUBLIC_URL = 'https://ais-pre-dforsaebo7nl3hpgeoyqed-960882533050.europe-west2.run.app';
     try {
-      let origin = window.location.origin || PUBLIC_URL;
-      if (!origin || origin.startsWith('file:') || origin === 'null' || origin.includes('localhost')) {
-        origin = PUBLIC_URL;
-      } else if (origin.includes('ais-dev-')) {
-        origin = origin.replace('ais-dev-', 'ais-pre-');
+      const origin = window.location.origin || '';
+      if (!origin || origin.startsWith('file:') || origin === 'null') {
+        return `?privateRoom=${encodeURIComponent(selectedRoomId)}&lang=${lang}`;
       }
-      return `${origin}${window.location.pathname || ''}?privateRoom=${encodeURIComponent(selectedRoomId)}&lang=${lang}`;
+      const cleanOrigin = origin.includes('ais-dev-') ? origin.replace('ais-dev-', 'ais-pre-') : origin;
+      return `${cleanOrigin}${window.location.pathname || ''}?privateRoom=${encodeURIComponent(selectedRoomId)}&lang=${lang}`;
     } catch {
-      return `${PUBLIC_URL}?privateRoom=${encodeURIComponent(selectedRoomId)}&lang=${lang}`;
+      return `?privateRoom=${encodeURIComponent(selectedRoomId)}&lang=${lang}`;
     }
   })();
 
@@ -193,31 +150,13 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
     };
     setMessages((prev) => [...prev, newMsg]);
 
-    // Send instantaneously via PeerJS DataConnection + persist via backend API
-    rtcCallManager.sendRoomChatMessage(selectedRoomId, newMsg);
-
-    fetch(`/api/rooms/${encodeURIComponent(selectedRoomId)}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: msgId,
-        senderId: mySenderId,
-        senderName: userProfile.name || 'متسابق',
-        senderAvatar: userProfile.avatar || '👑',
-        text: txt,
-        message: txt,
-      }),
-    }).catch(() => {});
+    // Persist instantaneously to Firebase Realtime Database
+    sendRoomMessage(selectedRoomId, newMsg).catch(() => {});
   };
 
   const handleDelete = (msgId: string) => {
     setMessages((prev) => prev.filter((m) => m.id !== msgId));
-    rtcCallManager.broadcastDeleteChatMessage(selectedRoomId, msgId);
-    fetch(`/api/rooms/${encodeURIComponent(selectedRoomId)}/chat/delete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messageId: msgId, requesterId: mySenderId }),
-    }).catch(() => {});
+    deleteRoomMessage(selectedRoomId, msgId).catch(() => {});
   };
 
   const handleCreatePrivateRoom = () => {
@@ -269,18 +208,18 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
                   <span>
                     {snap.peerReady
                       ? lang === 'ar'
-                        ? 'PeerJS متصل'
-                        : 'PeerJS Live'
+                        ? 'Firebase مباشر'
+                        : 'Firebase Live'
                       : lang === 'ar'
-                      ? 'جاري ربط PeerJS...'
-                      : 'Connecting PeerJS...'}
+                      ? 'جاري الربط...'
+                      : 'Connecting...'}
                   </span>
                 </span>
               </h3>
               <p className="text-[11px] text-slate-400">
                 {lang === 'ar'
-                  ? `اتصال مباشر عبر الإنترنت بين الموبايل واللابتوب بالكود (${selectedRoomId})`
-                  : `Direct PeerJS P2P connection between mobile & laptop using PIN (${selectedRoomId})`}
+                  ? `اتصال فيديو وصوت مباشر عبر WebRTC TURN بين جميع الهواتف بالكود (${selectedRoomId})`
+                  : `Direct WebRTC TURN video & voice connection across all phones using PIN (${selectedRoomId})`}
               </p>
             </div>
           </div>
@@ -472,7 +411,7 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
           </div>
         </div>
 
-        {/* Connected Devices in Room (PeerJS Presence) with Block Caller button */}
+        {/* Connected Devices in Room (Firebase RTDB + WebRTC Presence) with Block Caller button */}
         {roomPeers.length > 0 && (
           <div className="px-3 py-2 bg-slate-950/60 border-b border-slate-800 flex items-center gap-2 overflow-x-auto text-[11px]">
             <span className="text-slate-400 font-bold shrink-0">
@@ -531,8 +470,8 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
           {messages.length === 0 ? (
             <div className="text-center text-xs text-slate-500 py-10">
               {lang === 'ar'
-                ? `غرفة خاصة برقم (${selectedRoomId}) — افتح نفس الرقم على الموبايل واللابتوب للتحدث فيديو وصوت ورسائل مباشرة عبر PeerJS!`
-                : `Private Room (${selectedRoomId}) — open the same 4-digit PIN on mobile & laptop for live PeerJS video, voice, and chat!`}
+                ? `غرفة خاصة برقم (${selectedRoomId}) — افتح نفس الرقم على الموبايل واللابتوب للتحدث فيديو وصوت ورسائل فورية عبر Firebase و WebRTC!`
+                : `Private Room (${selectedRoomId}) — open the same 4-digit PIN on mobile & laptop for live Firebase & WebRTC video, voice, and chat!`}
             </div>
           ) : (
             messages.map((m) => {
@@ -605,7 +544,7 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
             type="text"
             value={chatText}
             onChange={(e) => setChatText(e.target.value)}
-            placeholder={lang === 'ar' ? 'اكتب رسالة مباشرة عبر PeerJS...' : 'Send direct message via PeerJS...'}
+            placeholder={lang === 'ar' ? 'اكتب رسالة فورية داخل الغرفة...' : 'Send live room message...'}
             className="flex-1 bg-slate-950 border border-slate-700 focus:border-amber-400 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none"
           />
           <button

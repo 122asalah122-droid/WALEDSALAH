@@ -48,6 +48,25 @@ import { rewardsService, NewlyUnlockedReward } from '../services/rewardsService'
 import { AudiencePollModal } from './AudiencePollModal';
 import { PhoneFriendModal } from './PhoneFriendModal';
 import { ReportPlayerModal, ReportTarget } from './ReportPlayerModal';
+import {
+  create1v1Room,
+  join1v1Room,
+  subscribeRoomState,
+  submitRoomAnswer,
+  advanceRoomRound,
+  forfeitRoom,
+  registerRoomPresenceHeartbeat,
+  submitBotAnswerForRound,
+  join4PlayerQueue,
+  fill4PlayerWithBots,
+  subscribe4PlayerQueue,
+  leave4PlayerQueue,
+  subscribeRoomMessages,
+  sendRoomMessage,
+  deleteRoomMessage,
+  hydrateQuestionsFromIds,
+  FirebaseRoomState,
+} from '../services/firebaseRoomService';
 
 interface MultiplayerArenaProps {
   lang: Language;
@@ -361,49 +380,43 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     };
   }, []);
 
-  // Automatically register and join room if joining via friend link or code (once per roomCode)
+  // Automatically register and join room if joining via friend link or code (Firebase RTDB)
   useEffect(() => {
     if (!roomCode || !initialRoomCode) return;
     if (joinedInitCodeRef.current === roomCode) return;
     joinedInitCodeRef.current = roomCode;
 
     setMyRole('player2_guest');
-    fetch(`/api/rooms/${encodeURIComponent(roomCode)}/join`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: myPlayerId,
-        name: playerName,
-        avatar: playerAvatar,
-        country: 'SA',
-        role: 'player2_guest',
-        isGuest: true,
-      }),
+    join1v1Room({
+      roomCode,
+      playerId: myPlayerId,
+      deviceId: myDeviceId,
+      name: playerName,
+      avatar: playerAvatar,
+      country: 'SA',
     })
-      .then((r) => r.json())
       .then((d) => {
-        if (d.role) {
-          setMyRole(d.role);
+        if (!d.success || !d.room) {
+          joinedInitCodeRef.current = '';
+          return;
         }
-        if (d.room?.category) {
-          setSelectedCategory(d.room.category);
+        if (d.role) setMyRole(d.role);
+        if (d.room.category) setSelectedCategory(d.room.category);
+        if (Array.isArray(d.room.contestants)) {
+          setContestants(d.room.contestants as ContestantInfo[]);
         }
-        if (d.contestants && Array.isArray(d.contestants)) {
-          setContestants(d.contestants);
-        } else if (d.room?.contestants && Array.isArray(d.room.contestants)) {
-          setContestants(d.room.contestants);
+        if (Array.isArray(d.questions) && d.questions.length > 0) {
+          setServerQuestions(d.questions);
+          questionTracker.markManyAsUsed(d.questions.map((q) => q.id));
         }
-        if (d.room?.status === 'finished' || d.room?.forfeitedBy) {
+        if (d.room.status === 'finished' || d.room.forfeitedBy) {
           setForfeitClosedInfo({
-            forfeitedRole: d.room.forfeitedBy,
-            winnerRole: d.room.winnerRole,
+            forfeiterName: d.room.forfeiterName || undefined,
+            forfeitedRole: d.room.forfeitedBy || undefined,
+            winnerRole: d.room.winnerRole || undefined,
           });
           setArenaState('podium');
-        } else if (
-          d.room?.status === 'reading' ||
-          d.room?.status === 'playing' ||
-          (d.room?.contestants && d.room.contestants.length >= 2)
-        ) {
+        } else if (d.room.status === 'playing' || d.room.contestants.length >= 2) {
           setArenaState('playing');
           sounds.playQuestionIntro();
         }
@@ -411,49 +424,7 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
       .catch(() => {
         joinedInitCodeRef.current = '';
       });
-  }, [initialRoomCode, roomCode, myPlayerId]);
-
-  // Real-time synchronization: In waiting_friend, poll room state to immediately auto-start when friend joins
-  useEffect(() => {
-    if (arenaState !== 'waiting_friend' || !roomCode) return;
-
-    const pollFriendJoin = setInterval(async () => {
-      // If we are the host creating a room, wait until /api/rooms/create completes so we don't race
-      if (!initialRoomCode && createdHostRoomRef.current !== roomCode) return;
-      try {
-        const res = await fetch(`/api/rooms/${encodeURIComponent(roomCode)}/state`);
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data.success && data.room) {
-          if (data.room.forfeitedBy || data.room.status === 'finished') {
-            clearInterval(pollFriendJoin);
-            forfeitSentRef.current = true;
-            setForfeitClosedInfo({
-              forfeitedRole: data.room.forfeitedBy,
-              winnerRole: data.room.winnerRole,
-            });
-            setArenaState('podium');
-            sounds.playWrong();
-            return;
-          }
-          if (data.room.contestants && Array.isArray(data.room.contestants)) {
-            setContestants(data.room.contestants);
-          }
-          if (
-            data.room.status === 'reading' ||
-            data.room.status === 'playing' ||
-            (data.room.contestants && data.room.contestants.length >= 2)
-          ) {
-            clearInterval(pollFriendJoin);
-            setArenaState('playing');
-            sounds.playQuestionIntro();
-          }
-        }
-      } catch {}
-    }, 450);
-
-    return () => clearInterval(pollFriendJoin);
-  }, [arenaState, roomCode, initialRoomCode]);
+  }, [initialRoomCode, roomCode, myPlayerId, myDeviceId, playerName, playerAvatar]);
 
   // Live Score paths
   const [liveScores, setLiveScores] = useState<{
@@ -559,33 +530,9 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
   // Toast notifications
   const [copyPinToast, setCopyPinToast] = useState<boolean>(false);
 
-  // Authoritative Synchronized Questions from Server (100% Identical on Both Devices)
+  // Authoritative Synchronized Questions from Firebase RTDB (100% Identical on All Devices)
   const [serverQuestions, setServerQuestions] = useState<Question[]>([]);
-
-  useEffect(() => {
-    if (!roomCode) return;
-    // Wait until Host has created the room or matched into 4P (or Guest is joining via initialRoomCode)
-    if (!initialRoomCode) {
-      if (arenaState === 'setup' || arenaState === 'searching_4p') return;
-      if (arenaState === 'waiting_friend' && createdHostRoomRef.current !== roomCode) return;
-    }
-
-    let isCancelled = false;
-    fetch(`/api/rooms/${encodeURIComponent(roomCode)}/questions?playerId=${encodeURIComponent(myPlayerId)}`)
-      .then((r) => r.json())
-      .then((data) => {
-        if (!isCancelled && data.success && Array.isArray(data.questions) && data.questions.length > 0) {
-          if (data.category) setSelectedCategory(data.category);
-          setServerQuestions(data.questions);
-          questionTracker.markManyAsUsed(data.questions.map((q: Question) => q.id));
-        }
-      })
-      .catch(() => {});
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [roomCode, arenaState, initialRoomCode, myPlayerId]);
+  const syncedQuestionSigRef = useRef<string>('');
 
   const questionsList = useMemo(() => {
     if (serverQuestions.length >= roundsCount) {
@@ -632,7 +579,7 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
   myRoleRef.current = myRole;
   const forfeitSentRef = useRef<boolean>(false);
 
-  // REQUIREMENT 1: Strict Audio, Speech & Unmount Exit Forfeit Reset
+  // REQUIREMENT 1: Strict Audio, Speech & Unmount Exit Forfeit Reset (Firebase RTDB)
   useEffect(() => {
     return () => {
       speechService.stop();
@@ -649,240 +596,59 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
         (st === 'playing' || (matchTypeRef.current === '1v1_friend' && st === 'waiting_friend'))
       ) {
         forfeitSentRef.current = true;
-        const endpoint =
-          matchTypeRef.current === '4player'
-            ? `/api/rooms/${encodeURIComponent(code)}/4p/forfeit`
-            : `/api/rooms/${encodeURIComponent(code)}/1v1/forfeit`;
-        const payload = JSON.stringify({ playerId: myPlayerIdRef.current, role: myRoleRef.current });
-        try {
-          navigator.sendBeacon(endpoint, new Blob([payload], { type: 'application/json' }));
-        } catch {}
-        try {
-          fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            keepalive: true,
-            body: payload,
-          }).catch(() => {});
-        } catch {}
+        forfeitRoom({
+          roomCode: code,
+          playerId: myPlayerIdRef.current,
+          role: myRoleRef.current,
+          matchType: matchTypeRef.current,
+        }).catch(() => {});
       }
     };
   }, []);
 
   // =========================================================================
-  // REAL-TIME CHAT & SYNCHRONIZATION ENGINE (SSE + FAST POLLING FALLBACK)
+  // REAL-TIME FIREBASE RTDB ROOM STATE & CHAT SYNCHRONIZATION (ZERO BACKEND)
   // =========================================================================
   useEffect(() => {
     const effectiveRoom = roomCode || 'M-GLOBAL';
+    let initialLoaded = false;
+    let prevCount = 0;
 
-    // 1. Fast Polling fallback every 1200ms
-    const pollInterval = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/rooms/${encodeURIComponent(effectiveRoom)}/messages`);
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data && Array.isArray(data.messages)) {
-          setChatMessages((prev) => {
-            const currentIds = new Set(prev.map((m) => m.id));
-            const serverIds = new Set(data.messages.map((m: ChatMessage) => m.id));
-            const incoming = data.messages.filter((m: ChatMessage) => !currentIds.has(m.id));
-            const cleaned = prev.filter((m) => serverIds.has(m.id) || m.id === 'c_init');
-
-            if (incoming.length === 0 && cleaned.length === prev.length) {
-              return prev;
-            }
-            return [...cleaned, ...incoming];
-          });
+    const unsubChat = subscribeRoomMessages(effectiveRoom, (incoming) => {
+      if (initialLoaded && incoming.length > prevCount) {
+        const newest = incoming[incoming.length - 1];
+        if (newest && newest.senderId !== myPlayerId) {
+          sounds.playChatMessage();
         }
-      } catch {}
-    }, 1200);
-
-    // 2. Real-time SSE Stream (with playerId & role for sub-second disconnect detection)
-    let eventSource: EventSource | null = null;
-    try {
-      const sseQuery = `?playerId=${encodeURIComponent(myPlayerId)}&role=${encodeURIComponent(myRole)}`;
-      eventSource = new EventSource(`/api/rooms/${encodeURIComponent(effectiveRoom)}/events${sseQuery}`);
-
-      eventSource.onmessage = (event) => {
-        try {
-          const parsed = JSON.parse(event.data);
-
-          // Chat message incoming
-          if (parsed.event === 'chat:message' && parsed.data?.message) {
-            const newMsg: ChatMessage = parsed.data.message;
-            setChatMessages((prev) => {
-              if (prev.some((m) => m.id === newMsg.id)) return prev;
-              return [...prev, newMsg];
-            });
-            if (newMsg.senderId !== myPlayerId) {
-              sounds.playChatMessage();
-            }
-          }
-
-          // Delete for Everyone
-          if (parsed.event === 'chat:deleted' && parsed.data?.messageId) {
-            const delId = parsed.data.messageId;
-            setChatMessages((prev) => prev.filter((m) => m.id !== delId));
-          }
-
-          // Player answered / Live score sync
-          if (parsed.event === 'duel:player_answered' || parsed.event === 'score:updated') {
-            const pData = parsed.data;
-            if (pData.player1_score !== undefined) {
-              setLiveScores({
-                player1_score: pData.player1_score || 0,
-                player2_score: pData.player2_score || 0,
-                player3_score: pData.player3_score || 0,
-                player4_score: pData.player4_score || 0,
-              });
-            }
-            if (pData.contestants && Array.isArray(pData.contestants)) {
-              setContestants(pData.contestants);
-            }
-            if (pData.role !== myRole) {
-              sounds.playSelectAnswer();
-            }
-          }
-
-          // All answered -> Reveal results & start forced auto-advance (idempotent per round, gated so unanswered player isn't prematurely locked)
-          if (parsed.event === 'duel:round_revealed') {
-            const rData = parsed.data || {};
-            if (typeof rData.currentIndex === 'number' && rData.currentIndex !== currentRoundRef.current - 1) {
-              return;
-            }
-            const contestantsList: ContestantInfo[] = Array.isArray(rData.contestants) ? rData.contestants : [];
-            const myEntry = contestantsList.find((c) => c.id === myPlayerIdRef.current);
-            const allInPayloadAnswered = contestantsList.length > 0 && contestantsList.every((c) => c.status === 'answered' || c.status === 'eliminated');
-            const roundTimedOut = Boolean(rData.roundStartedAt && (Date.now() - Number(rData.roundStartedAt) >= 41000));
-            if (selectedOptionRef.current === null && myEntry?.status !== 'answered' && !allInPayloadAnswered && !roundTimedOut) {
-              if (rData.contestants) setContestants(rData.contestants);
-              return;
-            }
-
-            const alreadyRevealed = isRoundRevealedRef.current;
-            isRoundRevealedRef.current = true;
-            setIsRoundRevealed(true);
-            setIsTimerRunning(false);
-            sounds.stopTensionAmbience();
-
-            if (rData.player1_score !== undefined) {
-              setLiveScores({
-                player1_score: rData.player1_score || 0,
-                player2_score: rData.player2_score || 0,
-                player3_score: rData.player3_score || 0,
-                player4_score: rData.player4_score || 0,
-              });
-            }
-            if (rData.contestants) {
-              setContestants(rData.contestants);
-            }
-
-            if (!alreadyRevealed) {
-              triggerAutoAdvance();
-            }
-          }
-
-          // Next round advanced or match finished cleanly
-          if (parsed.event === 'duel:next_round') {
-            if (parsed.data.player1_score !== undefined) {
-              setLiveScores({
-                player1_score: parsed.data.player1_score || 0,
-                player2_score: parsed.data.player2_score || 0,
-                player3_score: parsed.data.player3_score || 0,
-                player4_score: parsed.data.player4_score || 0,
-              });
-            }
-            const nextIdx = typeof parsed.data.currentIndex === 'number' ? parsed.data.currentIndex : 0;
-            if (parsed.data.status === 'finished' || nextIdx >= roundsCount) {
-              autoAdvanceTimersRef.current.forEach((t) => clearTimeout(t));
-              autoAdvanceTimersRef.current = [];
-              speechService.stop();
-              sounds.stopTensionAmbience();
-              setIsTimerRunning(false);
-              setForfeitClosedInfo(null);
-              setArenaState('podium');
-              sounds.playJackpotWin();
-            } else if (nextIdx + 1 > currentRoundRef.current) {
-              handleRoundAdvanced(nextIdx + 1);
-            }
-          }
-
-          // Game started by host (transitions guest to playing state)
-          if (parsed.event === 'game:started') {
-            setArenaState('playing');
-            setCurrentRound(1);
-            if (parsed.data?.contestants && Array.isArray(parsed.data.contestants)) {
-              setContestants(parsed.data.contestants);
-            }
-            sounds.playQuestionIntro();
-          }
-
-          // New player joined the room lobby
-          if (parsed.event === 'player:joined') {
-            if (parsed.data?.contestants && Array.isArray(parsed.data.contestants)) {
-              setContestants(parsed.data.contestants);
-            }
-          }
-
-          // Strict 1v1 Forfeit: Close & Lock match immediately on BOTH phones!
-          if (parsed.event === 'duel:forfeited') {
-            forfeitSentRef.current = true;
-            autoAdvanceTimersRef.current.forEach((t) => clearTimeout(t));
-            autoAdvanceTimersRef.current = [];
-            speechService.stop();
-            sounds.stopTensionAmbience();
-            if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-              window.speechSynthesis.cancel();
-            }
-            setIsTimerRunning(false);
-            setIsRevivalOpen(false);
-            setAudienceResult(null);
-            setPhoneResult(null);
-            setShowForfeitModal(false);
-
-            if (parsed.data?.player1_score !== undefined) {
-              setLiveScores((prev) => ({
-                ...prev,
-                player1_score: parsed.data.player1_score ?? prev.player1_score,
-                player2_score: parsed.data.player2_score ?? prev.player2_score,
-              }));
-            }
-            if (parsed.data?.contestants) {
-              setContestants(parsed.data.contestants);
-            }
-            setForfeitClosedInfo({
-              forfeiterName: parsed.data?.forfeiterName,
-              forfeitedRole: parsed.data?.forfeitedRole || parsed.data?.forfeitedBy,
-              winnerRole: parsed.data?.winnerRole,
-            });
-            setArenaState('podium');
-            sounds.playWrong();
-          }
-
-          // 4-Player Mid-Game Bot Replacement (silent roster update without bot notice text)
-          if (parsed.event === 'room:bot_replaced') {
-            if (Array.isArray(parsed.data?.contestants)) {
-              setContestants(parsed.data.contestants);
-            }
-          }
-        } catch {}
-      };
-    } catch {}
+      }
+      initialLoaded = true;
+      prevCount = incoming.length;
+      setChatMessages((prev) => {
+        const initMsg = prev.find((m) => m.id === 'c_init');
+        return initMsg ? [initMsg, ...incoming] : incoming;
+      });
+    });
 
     return () => {
-      clearInterval(pollInterval);
-      if (eventSource) eventSource.close();
+      unsubChat();
     };
-  }, [roomCode, myPlayerId, myRole, lang]);
+  }, [roomCode, myPlayerId]);
 
-  // Active Playing State Poll, Heartbeat & Unload Beacon (1v1 lock + 4P bot replacement & sync)
+  // Real-time Firebase RTDB Room State listener for waiting_friend & playing
   useEffect(() => {
-    if (arenaState !== 'playing' || !roomCode) return;
+    if ((arenaState !== 'waiting_friend' && arenaState !== 'playing') || !roomCode) return;
 
-    forfeitSentRef.current = false;
-    const pollMs = matchType === '1v1_friend' ? 350 : 1200;
+    if (arenaState === 'playing') {
+      forfeitSentRef.current = false;
+    }
 
-    const close1v1Now = (forfeitedByVal?: string | null, winnerRoleVal?: string | null) => {
+    const stopHeartbeat = registerRoomPresenceHeartbeat(roomCode, myPlayerId);
+
+    const closeMatchNow = (
+      forfeitedByVal?: string | null,
+      winnerRoleVal?: string | null,
+      forfeiterNameVal?: string | null
+    ) => {
       forfeitSentRef.current = true;
       autoAdvanceTimersRef.current.forEach((t) => clearTimeout(t));
       autoAdvanceTimersRef.current = [];
@@ -898,6 +664,7 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
       setShowForfeitModal(false);
       if (forfeitedByVal) {
         setForfeitClosedInfo({
+          forfeiterName: forfeiterNameVal || undefined,
           forfeitedRole: forfeitedByVal,
           winnerRole: winnerRoleVal || undefined,
         });
@@ -910,118 +677,146 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
       }
     };
 
-    const activeStatePoll = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/rooms/${encodeURIComponent(roomCode)}/state`);
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data.success && data.room) {
-          if (data.room.player1_score !== undefined) {
-            setLiveScores({
-              player1_score: data.room.player1_score ?? 0,
-              player2_score: data.room.player2_score ?? 0,
-              player3_score: data.room.player3_score ?? 0,
-              player4_score: data.room.player4_score ?? 0,
-            });
-          }
-          if (Array.isArray(data.room.contestants)) {
-            setContestants(data.room.contestants);
-          }
-          if (matchType === '1v1_friend' && (data.room.status === 'finished' || data.room.forfeitedBy)) {
-            clearInterval(activeStatePoll);
-            close1v1Now(data.room.forfeitedBy, data.room.winnerRole);
-          } else if (matchType === '4player' && data.room.status === 'finished') {
-            clearInterval(activeStatePoll);
-            close1v1Now(null, null);
-          } else {
-            // Fallback round sync in case an SSE event was missed across network
-            const roomContestants: ContestantInfo[] = Array.isArray(data.room.contestants) ? data.room.contestants : [];
-            const myPollEntry = roomContestants.find((c) => c.id === myPlayerIdRef.current);
-            const allPollAnswered = roomContestants.length > 0 && roomContestants.every((c) => c.status === 'answered' || c.status === 'eliminated');
-            const pollTimedOut = Boolean(data.room.roundStartedAt && (Date.now() - Number(data.room.roundStartedAt) >= 41000));
-            const safeToReveal =
-              selectedOptionRef.current !== null ||
-              myPollEntry?.status === 'answered' ||
-              allPollAnswered ||
-              pollTimedOut;
-
-            if (typeof data.room.currentIndex === 'number') {
-              if (data.room.currentIndex >= roundsCount) {
-                clearInterval(activeStatePoll);
-                setForfeitClosedInfo(null);
-                setArenaState('podium');
-                sounds.playJackpotWin();
-              } else if (data.room.currentIndex + 1 > currentRoundRef.current) {
-                handleRoundAdvanced(data.room.currentIndex + 1);
-              } else if (
-                data.room.currentIndex === currentRoundRef.current - 1 &&
-                data.room.status === 'revealed' &&
-                !isRoundRevealedRef.current &&
-                safeToReveal
-              ) {
-                revealRoundResults();
-              }
-            } else if (data.room.status === 'revealed' && !isRoundRevealedRef.current && safeToReveal) {
-              revealRoundResults();
-            }
-          }
+    const unsubRoom = subscribeRoomState(roomCode, (room: FirebaseRoomState) => {
+      // Hydrate exact shared question set from RTDB questionIds once per room
+      if (Array.isArray(room.questionIds) && room.questionIds.length > 0) {
+        const sig = `${room.roomId}:${room.questionIds.join(',')}`;
+        if (syncedQuestionSigRef.current !== sig) {
+          syncedQuestionSigRef.current = sig;
+          if (room.category) setSelectedCategory(room.category);
+          const hydrated = hydrateQuestionsFromIds(
+            room.questionIds,
+            room.totalQuestions || roundsCount,
+            room.category,
+            room.roomId
+          );
+          setServerQuestions(hydrated);
+          questionTracker.markManyAsUsed(hydrated.map((q) => q.id));
         }
-      } catch {}
-    }, pollMs);
+      }
 
-    const sendHeartbeat = () => {
-      fetch(`/api/rooms/${encodeURIComponent(roomCode)}/1v1/heartbeat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId: myPlayerId, role: myRole }),
-      })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((d) => {
-          if (matchType === '1v1_friend' && d && (d.status === 'finished' || d.forfeitedBy)) {
-            clearInterval(activeStatePoll);
-            clearInterval(heartbeatTimer);
-            close1v1Now(d.forfeitedBy, d.winnerRole);
-          }
-        })
-        .catch(() => {});
-    };
+      setLiveScores({
+        player1_score: room.player1_score ?? 0,
+        player2_score: room.player2_score ?? 0,
+        player3_score: room.player3_score ?? 0,
+        player4_score: room.player4_score ?? 0,
+      });
 
-    sendHeartbeat();
-    const heartbeatMs = matchType === '1v1_friend' ? 900 : 2000;
-    const heartbeatTimer = setInterval(sendHeartbeat, heartbeatMs);
+      if (Array.isArray(room.contestants) && room.contestants.length > 0) {
+        setContestants(room.contestants as ContestantInfo[]);
+      }
+
+      // Transition from waiting_friend -> playing as soon as friend enters with the 4-digit PIN
+      if (arenaStateRef.current === 'waiting_friend') {
+        if (room.forfeitedBy || room.status === 'finished') {
+          closeMatchNow(room.forfeitedBy, room.winnerRole, room.forfeiterName);
+          return;
+        }
+        if (room.status === 'playing' || room.contestants.length >= 2) {
+          setArenaState('playing');
+          sounds.playQuestionIntro();
+        }
+        return;
+      }
+
+      // Active gameplay sync
+      if (matchType === '1v1_friend' && (room.status === 'finished' || room.forfeitedBy)) {
+        closeMatchNow(room.forfeitedBy, room.winnerRole, room.forfeiterName);
+        return;
+      }
+      if (matchType === '4player' && room.status === 'finished') {
+        closeMatchNow(null, null, null);
+        return;
+      }
+
+      const myEntry = room.contestants.find((c) => c.id === myPlayerIdRef.current);
+      const allAnswered =
+        room.contestants.length >= 2 &&
+        room.contestants.every(
+          (c) =>
+            (c.status === 'answered' && c.answeredRound === currentRoundRef.current - 1) ||
+            c.status === 'eliminated'
+        );
+      const roundTimedOut = Boolean(
+        room.roundStartedAt && Date.now() - Number(room.roundStartedAt) >= 41000
+      );
+      const safeToReveal =
+        selectedOptionRef.current !== null ||
+        (myEntry?.status === 'answered' && myEntry?.answeredRound === currentRoundRef.current - 1) ||
+        allAnswered ||
+        roundTimedOut;
+
+      if (typeof room.currentIndex === 'number') {
+        if (room.currentIndex >= roundsCount) {
+          closeMatchNow(null, null, null);
+        } else if (room.currentIndex + 1 > currentRoundRef.current) {
+          handleRoundAdvanced(room.currentIndex + 1);
+        } else if (
+          room.currentIndex === currentRoundRef.current - 1 &&
+          room.status === 'revealed' &&
+          !isRoundRevealedRef.current &&
+          safeToReveal
+        ) {
+          revealRoundResults();
+        }
+      }
+    });
 
     const handlePageExitForfeit = () => {
       if (forfeitSentRef.current) return;
       forfeitSentRef.current = true;
-      try {
-        const payload = JSON.stringify({ playerId: myPlayerId, role: myRole });
-        const blob = new Blob([payload], { type: 'application/json' });
-        const endpoint =
-          matchType === '4player'
-            ? `/api/rooms/${encodeURIComponent(roomCode)}/4p/forfeit`
-            : `/api/rooms/${encodeURIComponent(roomCode)}/1v1/forfeit`;
-        navigator.sendBeacon(endpoint, blob);
-        fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          keepalive: true,
-          body: payload,
-        }).catch(() => {});
-      } catch {}
+      forfeitRoom({
+        roomCode,
+        playerId: myPlayerId,
+        role: myRole,
+        matchType,
+        playerName,
+      }).catch(() => {});
     };
 
     window.addEventListener('pagehide', handlePageExitForfeit);
     window.addEventListener('beforeunload', handlePageExitForfeit);
 
     return () => {
-      clearInterval(activeStatePoll);
-      clearInterval(heartbeatTimer);
+      unsubRoom();
+      stopHeartbeat();
       window.removeEventListener('pagehide', handlePageExitForfeit);
       window.removeEventListener('beforeunload', handlePageExitForfeit);
     };
-  }, [arenaState, roomCode, matchType, myPlayerId, myRole]);
+  }, [arenaState, roomCode, matchType, myPlayerId, myRole, playerName, roundsCount]);
 
-  // Send message with actual player nickname
+  // Schedule AI bot answers directly from host client in 4-Player matches (zero backend needed)
+  useEffect(() => {
+    if (arenaState !== 'playing' || matchType !== '4player' || !roomCode) return;
+    if (myRole !== 'player1_host') return;
+    const bots = contestants.filter((c) => c.isBot);
+    if (bots.length === 0) return;
+
+    const roundIdx = Math.max(0, currentRound - 1);
+    const correctIdx = currentQuestion.correctIndex;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+
+    bots.forEach((bot) => {
+      if (bot.status === 'answered' && bot.answeredRound === roundIdx) return;
+      const delayMs = 4500 + Math.floor(Math.random() * 10500);
+      const t = setTimeout(() => {
+        if (arenaStateRef.current !== 'playing' || currentRoundRef.current - 1 !== roundIdx) return;
+        submitBotAnswerForRound({
+          roomCode,
+          bot,
+          roundIndex: roundIdx,
+          correctIndex: correctIdx,
+        }).catch(() => {});
+      }, delayMs);
+      timers.push(t);
+    });
+
+    return () => {
+      timers.forEach((t) => clearTimeout(t));
+    };
+  }, [arenaState, matchType, roomCode, myRole, currentRound, currentQuestion.correctIndex, contestants.length]);
+
+  // Send message with actual player nickname via Firebase Realtime Database
   const handleSendMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const textToSend = chatInput.trim();
@@ -1043,28 +838,13 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     setChatMessages((prev) => [...prev, newMsg]);
     setChatInput('');
 
-    fetch(`/api/rooms/${encodeURIComponent(effectiveRoom)}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: msgId,
-        senderId: myPlayerId,
-        senderName: playerName,
-        senderAvatar: playerAvatar,
-        text: textToSend,
-        message: textToSend,
-      }),
-    }).catch(() => {});
+    sendRoomMessage(effectiveRoom, newMsg).catch(() => {});
   };
 
   const handleDeleteChatMessage = (messageId: string) => {
     setChatMessages((prev) => prev.filter((m) => m.id !== messageId));
     const effectiveRoom = roomCode || 'M-GLOBAL';
-    fetch(`/api/rooms/${encodeURIComponent(effectiveRoom)}/chat/delete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messageId, requesterId: myPlayerId }),
-    }).catch(() => {});
+    deleteRoomMessage(effectiveRoom, messageId).catch(() => {});
   };
 
   // =========================================================================
@@ -1115,24 +895,25 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     if (hasMatched4pRef.current || hasFilledBotsRef.current) return;
     hasFilledBotsRef.current = true;
 
-    fetch('/api/matchmaking/4p/fill-bots', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: myDeviceId,
-        playerId: myPlayerId,
-        name: playerName,
-        avatar: playerAvatar,
-        country: 'SA',
-        category: selectedCategory,
-        lang,
-        excludeIds: Array.from(questionTracker.getUsedIds()),
-      }),
+    fill4PlayerWithBots({
+      deviceId: myDeviceId,
+      playerId: myPlayerId,
+      name: playerName,
+      avatar: playerAvatar,
+      country: 'SA',
+      category: selectedCategory,
+      lang,
+      excludeIds: Array.from(questionTracker.getUsedIds()),
     })
-      .then((r) => r.json())
       .then((data) => {
-        if (data.matched && data.roomId) {
-          enterMatched4pRoom(data);
+        if (data.matched && data.roomId && data.room) {
+          enterMatched4pRoom({
+            matched: true,
+            roomId: data.roomId,
+            role: data.role,
+            contestants: data.room.contestants,
+            room: { ...data.room, questions: data.questions },
+          });
         } else {
           hasFilledBotsRef.current = false;
         }
@@ -1149,43 +930,52 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     hasFilledBotsRef.current = false;
     hasMatched4pRef.current = false;
     rewardRecordedRef.current = false;
+    syncedQuestionSigRef.current = '';
     setServerQuestions([]);
     setMatchType('4player');
     setArenaState('searching_4p');
     setSearchTimeoutLeft(60);
     sounds.playSelectAnswer();
 
-    fetch('/api/matchmaking/4p/join', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: myDeviceId,
-        playerId: myPlayerId,
-        name: playerName,
-        avatar: playerAvatar,
-        country: 'SA',
-        category: selectedCategory,
-        lang,
-        excludeIds: Array.from(questionTracker.getUsedIds()),
-      }),
+    join4PlayerQueue({
+      deviceId: myDeviceId,
+      playerId: myPlayerId,
+      name: playerName,
+      avatar: playerAvatar,
+      country: 'SA',
+      category: selectedCategory,
+      lang,
+      excludeIds: Array.from(questionTracker.getUsedIds()),
     })
-      .then((r) => r.json())
       .then((data) => {
-        if (data.matched && data.roomId) {
-          enterMatched4pRoom(data);
+        if (data.matched && data.roomId && data.room) {
+          enterMatched4pRoom({
+            matched: true,
+            roomId: data.roomId,
+            role: data.role,
+            contestants: data.room.contestants,
+            room: { ...data.room, questions: data.questions },
+          });
         } else {
-          setFourPlayerQueueCount(data.queueCount || 1);
-          setFourPlayersNeeded(data.playersNeeded ?? 3);
-          if (typeof data.searchSecondsLeft === 'number') {
-            setSearchTimeoutLeft(data.searchSecondsLeft);
+          const count = data.queueCount || 1;
+          setFourPlayerQueueCount(count);
+          setFourPlayersNeeded(Math.max(0, 4 - count));
+          if (data.players) {
+            setWaitingPlayersList(
+              data.players.map((p) => ({
+                id: p.playerId,
+                name: p.name,
+                avatar: p.avatar,
+                country: p.country,
+              }))
+            );
           }
-          if (data.players) setWaitingPlayersList(data.players);
         }
       })
       .catch(() => {});
   }, [myDeviceId, myPlayerId, playerName, playerAvatar, selectedCategory, lang, enterMatched4pRoom]);
 
-  // 1-Minute Waiting Countdown & Global Real-Player Polling (At 0s fills empty slots with rotating AI bots)
+  // 1-Minute Waiting Countdown & Real-Time Firebase RTDB 4-Player Queue Listener
   useEffect(() => {
     if (arenaState !== 'searching_4p') return;
 
@@ -1202,38 +992,36 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
       });
     }, 1000);
 
-    const poller = setInterval(async () => {
-      if (hasMatched4pRef.current) {
-        clearInterval(poller);
+    const unsubQueue = subscribe4PlayerQueue(myDeviceId, {
+      onQueueUpdate: (players) => {
+        if (hasMatched4pRef.current) return;
+        const count = Math.max(1, Math.min(4, players.length));
+        setFourPlayerQueueCount(count);
+        setFourPlayersNeeded(Math.max(0, 4 - count));
+        setWaitingPlayersList(
+          players.slice(0, 4).map((p) => ({
+            id: p.playerId,
+            name: p.name,
+            avatar: p.avatar,
+            country: p.country,
+          }))
+        );
+      },
+      onMatched: (data) => {
         clearInterval(countdown);
-        return;
-      }
-      try {
-        const res = await fetch(`/api/matchmaking/4p/status?deviceId=${encodeURIComponent(myDeviceId)}`);
-        if (!res.ok) return;
-        const data = await res.json();
-
-        if (data.matched && data.roomId) {
-          clearInterval(poller);
-          clearInterval(countdown);
-          enterMatched4pRoom(data);
-        } else {
-          setFourPlayerQueueCount(data.queueCount || 1);
-          setFourPlayersNeeded(data.playersNeeded ?? Math.max(0, 4 - (data.queueCount || 1)));
-          if (typeof data.searchSecondsLeft === 'number') {
-            setSearchTimeoutLeft(data.searchSecondsLeft);
-            if (data.searchSecondsLeft <= 0 && !hasMatched4pRef.current) {
-              triggerBotFillFor4P();
-            }
-          }
-          if (data.players) setWaitingPlayersList(data.players);
-        }
-      } catch {}
-    }, 1000);
+        enterMatched4pRoom({
+          matched: true,
+          roomId: data.roomId,
+          role: data.role,
+          contestants: data.room.contestants,
+          room: { ...data.room, questions: data.questions },
+        });
+      },
+    });
 
     return () => {
       clearInterval(countdown);
-      clearInterval(poller);
+      unsubQueue();
     };
   }, [arenaState, myDeviceId, triggerBotFillFor4P, enterMatched4pRoom]);
 
@@ -1259,21 +1047,17 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     sounds.playSelectAnswer();
 
     try {
-      const res = await fetch(`/api/rooms/${encodeURIComponent(cleanPin)}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: myPlayerId,
-          name: playerName,
-          avatar: playerAvatar,
-          country: 'SA',
-          role: 'player2_guest',
-          isGuest: true,
-          requireExisting: true,
-        }),
+      const data = await join1v1Room({
+        roomCode: cleanPin,
+        playerId: myPlayerId,
+        deviceId: myDeviceId,
+        name: playerName,
+        avatar: playerAvatar,
+        country: 'SA',
+        requireExisting: true,
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
+
+      if (!data.success || !data.room) {
         setJoinCodeError(data.error || (lang === 'ar' ? 'كود الغرفة غير صحيح أو غير متاح' : 'Invalid or closed room code'));
         sounds.playWrong();
         setIsJoiningByCode(false);
@@ -1285,6 +1069,7 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
       advancingFromRoundRef.current = 0;
       initializedRoundKeyRef.current = '';
       spokenQuestionKeyRef.current = '';
+      syncedQuestionSigRef.current = '';
       currentRoundRef.current = 1;
       selectedOptionRef.current = null;
       isRoundRevealedRef.current = false;
@@ -1300,34 +1085,28 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
       setPhoneResult(null);
       setLifelines({ fiftyFifty: true, askAudience: true, phoneFriend: true, switchQuestion: true });
       setLiveScores({
-        player1_score: data.room?.player1_score || 0,
-        player2_score: data.room?.player2_score || 0,
+        player1_score: data.room.player1_score || 0,
+        player2_score: data.room.player2_score || 0,
         player3_score: 0,
         player4_score: 0,
       });
-      setServerQuestions([]);
       setMatchType('1v1_friend');
       setRoomCode(cleanPin);
       setMyRole(data.role || 'player2_guest');
       setForfeitClosedInfo(null);
-      if (data.room?.category) setSelectedCategory(data.room.category);
-      if (Array.isArray(data.room?.contestants)) {
-        setContestants(data.room.contestants);
+      if (data.room.category) setSelectedCategory(data.room.category);
+      if (Array.isArray(data.room.contestants)) {
+        setContestants(data.room.contestants as ContestantInfo[]);
       }
-
-      try {
-        const qRes = await fetch(`/api/rooms/${encodeURIComponent(cleanPin)}/questions?playerId=${encodeURIComponent(myPlayerId)}`);
-        const qData = await qRes.json();
-        if (qData.success && Array.isArray(qData.questions) && qData.questions.length > 0) {
-          setServerQuestions(qData.questions);
-          questionTracker.markManyAsUsed(qData.questions.map((q: Question) => q.id));
-        }
-      } catch {}
+      if (Array.isArray(data.questions) && data.questions.length > 0) {
+        setServerQuestions(data.questions);
+        questionTracker.markManyAsUsed(data.questions.map((q) => q.id));
+      }
 
       setArenaState('playing');
       sounds.playQuestionIntro();
     } catch {
-      setJoinCodeError(lang === 'ar' ? 'تعذر الاتصال بالغرفة — تأكد من الشبكة' : 'Connection failed');
+      setJoinCodeError(lang === 'ar' ? 'تعذر الاتصال بقاعدة البيانات — تأكد من الشبكة' : 'Connection failed');
     } finally {
       setIsJoiningByCode(false);
     }
@@ -1522,33 +1301,29 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
       onEarnPoints(pts);
     }
 
-    fetch(`/api/rooms/${encodeURIComponent(roomCode)}/answer`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        playerId: myPlayerId,
-        role: myRole,
-        optionIndex: idx,
-        roundIndex: roundIdx,
-        responseTime: responseSec,
-        isCorrect,
-        pointsEarned: pts,
-      }),
+    submitRoomAnswer({
+      roomCode,
+      playerId: myPlayerId,
+      role: myRole,
+      optionIndex: idx,
+      roundIndex: roundIdx,
+      responseTime: responseSec,
+      isCorrect,
+      pointsEarned: pts,
     })
-      .then((r) => r.json())
       .then((data) => {
-        if (data.player1_score !== undefined) {
+        if (data.room) {
           setLiveScores({
-            player1_score: data.player1_score || 0,
-            player2_score: data.player2_score || 0,
-            player3_score: data.player3_score || 0,
-            player4_score: data.player4_score || 0,
+            player1_score: data.room.player1_score || 0,
+            player2_score: data.room.player2_score || 0,
+            player3_score: data.room.player3_score || 0,
+            player4_score: data.room.player4_score || 0,
           });
+          if (Array.isArray(data.room.contestants)) {
+            setContestants(data.room.contestants as ContestantInfo[]);
+          }
         }
-        if (Array.isArray(data.contestants)) {
-          setContestants(data.contestants);
-        }
-        if (data.status === 'revealed' || data.allAnswered || data.bothAnswered) {
+        if (data.allAnswered || data.room?.status === 'revealed') {
           revealRoundResults();
         }
       })
@@ -1626,14 +1401,13 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     }
 
     try {
-      const res = await fetch(`/api/rooms/${encodeURIComponent(roomCode)}/next`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ currentRound: roundNow }),
+      const d = await advanceRoomRound({
+        roomCode,
+        currentRound: roundNow,
+        forceTimeout: timeLeft <= 1,
       });
-      const d = await res.json().catch(() => null);
       if (d && d.deferred) {
-        // Server is still waiting for the other connected player to finish answering within 32s window
+        // Still waiting for the other connected player to finish answering within 40s window
         advancingFromRoundRef.current = Math.max(0, roundNow - 1);
         return;
       }
@@ -1802,17 +1576,12 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     setIsTimerRunning(false);
     setServerQuestions([]);
 
-    const endpoint =
-      matchType === '4player'
-        ? `/api/rooms/${encodeURIComponent(roomCode)}/4p/forfeit`
-        : `/api/rooms/${encodeURIComponent(roomCode)}/1v1/forfeit`;
-
-    const payload = JSON.stringify({ playerId: myPlayerId, role: myRole });
-    fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      keepalive: true,
-      body: payload,
+    forfeitRoom({
+      roomCode,
+      playerId: myPlayerId,
+      role: myRole,
+      matchType,
+      playerName,
     }).catch(() => {});
 
     if (matchType === '4player') {
@@ -2025,21 +1794,18 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
                 ]);
                 setArenaState('waiting_friend');
                 sounds.playSelectAnswer();
-                fetch('/api/rooms/create', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    roomId: freshPin,
-                    category: selectedCategory,
-                    lang,
-                    totalQuestions: roundsCount,
-                    hostId: myPlayerId,
-                    hostName: playerName,
-                    hostAvatar: playerAvatar,
-                    excludeIds: Array.from(questionTracker.getUsedIds()),
-                  }),
+                syncedQuestionSigRef.current = '';
+                create1v1Room({
+                  preferredPin: freshPin,
+                  category: selectedCategory,
+                  lang,
+                  totalQuestions: roundsCount,
+                  hostId: myPlayerId,
+                  hostDeviceId: myDeviceId,
+                  hostName: playerName,
+                  hostAvatar: playerAvatar,
+                  excludeIds: Array.from(questionTracker.getUsedIds()),
                 })
-                  .then((r) => r.json())
                   .then((d) => {
                     const confirmedRoomId = d?.roomId || freshPin;
                     createdHostRoomRef.current = confirmedRoomId;
@@ -2298,11 +2064,12 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
             onClick={() => {
               if (matchType === '1v1_friend' && roomCode) {
                 forfeitSentRef.current = true;
-                fetch(`/api/rooms/${encodeURIComponent(roomCode)}/1v1/forfeit`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  keepalive: true,
-                  body: JSON.stringify({ playerId: myPlayerId, role: myRole }),
+                forfeitRoom({
+                  roomCode,
+                  playerId: myPlayerId,
+                  role: myRole,
+                  matchType: '1v1_friend',
+                  playerName,
                 }).catch(() => {});
               }
               setArenaState('setup');
@@ -2377,11 +2144,7 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
                 hasJoined4pRef.current = false;
                 hasFilledBotsRef.current = false;
                 hasMatched4pRef.current = false;
-                fetch('/api/matchmaking/4p/leave', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ deviceId: myDeviceId, playerId: myPlayerId }),
-                }).catch(() => {});
+                leave4PlayerQueue(myDeviceId).catch(() => {});
                 setArenaState('setup');
               }}
               className="w-full sm:w-auto px-6 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs rounded-xl transition"
