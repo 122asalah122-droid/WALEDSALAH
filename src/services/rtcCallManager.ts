@@ -90,11 +90,13 @@ export function normalizePrivateRoomCode(input: string): string {
 
 // Metered STUN + TURN Relay configuration for reliable cross-network / mobile / Android WebView WebRTC
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env || {};
-const METERED_TURN_USERNAME = env.VITE_TURN_USERNAME || 'c89281151b67d76b612ff2';
-const METERED_TURN_CREDENTIAL = env.VITE_TURN_CREDENTIAL || '2KTt047g0zNjzh5pG';
+const METERED_TURN_USERNAME = env.VITE_TURN_USERNAME || 'ce9281151bf7d716b612f1c2';
+const METERED_TURN_CREDENTIAL = env.VITE_TURN_CREDENTIAL || '2KTlO47g+NjzHSpG';
 
 export const ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:stun.relay.metered.ca:80' },
+  {
+    urls: 'stun:stun.relay.metered.ca:80',
+  },
   {
     urls: 'turn:global.relay.metered.ca:80',
     username: METERED_TURN_USERNAME,
@@ -115,8 +117,6 @@ export const ICE_SERVERS: RTCIceServer[] = [
     username: METERED_TURN_USERNAME,
     credential: METERED_TURN_CREDENTIAL,
   },
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
 ];
 
 const RTC_CONFIG: RTCConfiguration = {
