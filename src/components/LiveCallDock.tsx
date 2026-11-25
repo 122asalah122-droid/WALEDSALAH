@@ -24,6 +24,8 @@ interface LiveCallDockProps {
   lang: Language;
   activeRoomId: string;
   onOpenRoomsModal: () => void;
+  isVip?: boolean;
+  onOpenVip?: () => void;
 }
 
 const RemoteMediaTile: React.FC<{
@@ -157,7 +159,7 @@ const RemoteMediaTile: React.FC<{
 };
 
 // Active Private Call Floating Stage & Incoming Call Card (NO bottom dock bar)
-export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang }) => {
+export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false, onOpenVip }) => {
   const [snap, setSnap] = useState<RtcSnapshot>(() => rtcCallManager.getSnapshot());
   const [videoExpanded, setVideoExpanded] = useState<boolean>(true);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
@@ -281,7 +283,13 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang }) => {
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 mt-3">
             <button
               type="button"
-              onClick={() => rtcCallManager.acceptIncomingCall()}
+              onClick={() => {
+                if (!isVip) {
+                  onOpenVip?.();
+                  return;
+                }
+                rtcCallManager.acceptIncomingCall();
+              }}
               className="py-2 px-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs flex items-center justify-center gap-1 transition active:scale-95"
             >
               <Phone className="w-3.5 h-3.5" />
@@ -346,14 +354,26 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang }) => {
 
             <div className="flex items-center gap-1 shrink-0">
               <button
-                onClick={() => rtcCallManager.toggleMic()}
+                onClick={() => {
+                  if (!isVip) {
+                    onOpenVip?.();
+                    return;
+                  }
+                  rtcCallManager.toggleMic();
+                }}
                 className={`p-1.5 rounded-lg border ${snap.micOn ? 'bg-emerald-500/15 border-emerald-500/50 text-emerald-300' : 'bg-rose-500/15 border-rose-500/50 text-rose-300'}`}
                 title={lang === 'ar' ? 'فتح/قفل الميكروفون' : 'Toggle Mic'}
               >
                 {snap.micOn ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5" />}
               </button>
               <button
-                onClick={() => rtcCallManager.toggleCamera()}
+                onClick={() => {
+                  if (!isVip) {
+                    onOpenVip?.();
+                    return;
+                  }
+                  rtcCallManager.toggleCamera();
+                }}
                 className={`p-1.5 rounded-lg border ${snap.camOn ? 'bg-blue-500/20 border-blue-400 text-blue-300' : 'bg-slate-900 border-slate-700 text-slate-300'}`}
                 title={lang === 'ar' ? 'تشغيل/إيقاف الكاميرا' : 'Toggle Camera'}
               >

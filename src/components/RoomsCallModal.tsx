@@ -18,6 +18,7 @@ import {
   Flag,
   ShieldCheck,
   Wifi,
+  Crown,
 } from 'lucide-react';
 import { ChatMessage, Language, UserProfile } from '../types/game';
 import {
@@ -42,6 +43,8 @@ interface RoomsCallModalProps {
   initialTab?: 'public' | 'private';
   privateRoomId: string;
   onChangePrivateRoomId: (roomId: string) => void;
+  isVip?: boolean;
+  onOpenVip?: () => void;
 }
 
 export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
@@ -51,6 +54,8 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
   userProfile,
   privateRoomId,
   onChangePrivateRoomId,
+  isVip = false,
+  onOpenVip,
 }) => {
   const [joinInput, setJoinInput] = useState<string>('');
   const [joinError, setJoinError] = useState<string>('');
@@ -356,16 +361,32 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
         <div className="p-3 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <button
-              onClick={() => rtcCallManager.toggleMic()}
+              onClick={() => {
+                if (!isVip) {
+                  onOpenVip?.();
+                  return;
+                }
+                rtcCallManager.toggleMic();
+              }}
               className={`px-3 py-2 rounded-xl border text-xs font-black flex items-center gap-1.5 transition ${
-                snap.micOn
+                !isVip
+                  ? 'bg-amber-500/15 border-amber-500/50 text-amber-300 hover:bg-amber-500/25'
+                  : snap.micOn
                   ? 'bg-emerald-500/15 border-emerald-500/60 text-emerald-300'
                   : 'bg-rose-500/15 border-rose-500/60 text-rose-300'
               }`}
             >
-              {snap.micOn ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
+              {!isVip ? (
+                <Crown className="w-4 h-4 text-amber-400" />
+              ) : snap.micOn ? (
+                <Mic className="w-4 h-4" />
+              ) : (
+                <MicOff className="w-4 h-4" />
+              )}
               <span>
-                {snap.micOn
+                {!isVip
+                  ? (lang === 'ar' ? 'المايك (VIP)' : 'Mic (VIP)')
+                  : snap.micOn
                   ? (lang === 'ar' ? 'المايك مفتوح' : 'Mic Open')
                   : (lang === 'ar' ? 'المايك مقفول' : 'Mic Closed')}
               </span>
@@ -393,18 +414,38 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
             ) : (
               <>
                 <button
-                  onClick={() => rtcCallManager.startCall(selectedRoomId, 'video')}
-                  className="px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-black text-xs flex items-center gap-1.5 shadow"
+                  onClick={() => {
+                    if (!isVip) {
+                      onOpenVip?.();
+                      return;
+                    }
+                    rtcCallManager.startCall(selectedRoomId, 'video');
+                  }}
+                  className={`px-3 py-2 rounded-xl font-black text-xs flex items-center gap-1.5 shadow ${
+                    isVip
+                      ? 'bg-blue-600 hover:bg-blue-500 text-white'
+                      : 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300'
+                  }`}
                 >
-                  <Video className="w-4 h-4" />
-                  <span>{lang === 'ar' ? 'مكالمة فيديو' : 'Video Call'}</span>
+                  {isVip ? <Video className="w-4 h-4" /> : <Crown className="w-4 h-4" />}
+                  <span>{isVip ? (lang === 'ar' ? 'مكالمة فيديو' : 'Video Call') : (lang === 'ar' ? 'فيديو VIP' : 'VIP Video')}</span>
                 </button>
                 <button
-                  onClick={() => rtcCallManager.startCall(selectedRoomId, 'audio')}
-                  className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs flex items-center gap-1.5 shadow"
+                  onClick={() => {
+                    if (!isVip) {
+                      onOpenVip?.();
+                      return;
+                    }
+                    rtcCallManager.startCall(selectedRoomId, 'audio');
+                  }}
+                  className={`px-3 py-2 rounded-xl font-black text-xs flex items-center gap-1.5 shadow ${
+                    isVip
+                      ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                      : 'bg-slate-800 hover:bg-slate-700 border border-amber-500/40 text-amber-300'
+                  }`}
                 >
-                  <Phone className="w-4 h-4" />
-                  <span>{lang === 'ar' ? 'اتصال عادي' : 'Voice Call'}</span>
+                  {isVip ? <Phone className="w-4 h-4" /> : <Crown className="w-4 h-4" />}
+                  <span>{isVip ? (lang === 'ar' ? 'اتصال عادي' : 'Voice Call') : (lang === 'ar' ? 'صوت VIP' : 'VIP Voice')}</span>
                 </button>
               </>
             )}

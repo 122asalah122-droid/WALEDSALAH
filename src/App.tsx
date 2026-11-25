@@ -25,6 +25,7 @@ import {
   Gift,
   RefreshCw,
   WifiOff,
+  Crown,
 } from 'lucide-react';
 import {
   Question,
@@ -64,8 +65,11 @@ import { BadgesModal } from './components/BadgesModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { MicPermissionsModal } from './components/MicPermissionsModal';
+import { VipMembershipModal } from './components/VipMembershipModal';
+import { AdBanner } from './components/AdBanner';
 import { speechService } from './utils/speechService';
 import { rewardsService, NewlyUnlockedReward } from './services/rewardsService';
+import { vipBillingService, VipServiceSnapshot } from './services/vipBillingService';
 import {
   generatePrivateRoomCode,
   normalizePrivateRoomCode,
@@ -180,6 +184,15 @@ export default function App() {
   const [rewardToast, setRewardToast] = useState<{ title: string; points: number; icon: string } | null>(null);
   const [isOfflineModalOpen, setIsOfflineModalOpen] = useState<boolean>(false);
   const [isCheckingOnline, setIsCheckingOnline] = useState<boolean>(false);
+  const [vipSnap, setVipSnap] = useState<VipServiceSnapshot>(() => vipBillingService.getSnapshot());
+  const [isVipModalOpen, setIsVipModalOpen] = useState<boolean>(false);
+  const [vipModalReason, setVipModalReason] = useState<'mic_camera' | 'remove_ads' | 'general'>('general');
+
+  const openVipModal = (reason: 'mic_camera' | 'remove_ads' | 'general' = 'general') => {
+    sounds.playSelectAnswer();
+    setVipModalReason(reason);
+    setIsVipModalOpen(true);
+  };
 
   // Sound settings
   const [isMuted, setIsMuted] = useState(sounds.getMuted());
@@ -244,6 +257,10 @@ export default function App() {
       setBadgesCount(rewardsService.getUnlockedCount());
       setHasDailyGift(rewardsService.canClaimDailyGift());
     });
+  }, []);
+
+  useEffect(() => {
+    return vipBillingService.subscribe(setVipSnap);
   }, []);
 
   const triggerRewardsToast = (awards: NewlyUnlockedReward[]) => {
@@ -872,6 +889,8 @@ export default function App() {
         }}
         badgesCount={badgesCount}
         hasDailyGift={hasDailyGift}
+        isVip={vipSnap.isVip}
+        onOpenVip={() => openVipModal('general')}
       />
 
       {/* Celebratory Badge / Encouragement Gift Toast */}
@@ -914,6 +933,8 @@ export default function App() {
                 setIsRoomsModalOpen(true);
               });
             }}
+            isVip={vipSnap.isVip}
+            onOpenVip={() => openVipModal('mic_camera')}
           />
         ) : gameStatus === 'lobby' ? (
           /* ================= LOBBY / HERO STAGE ================= */
@@ -1213,6 +1234,61 @@ export default function App() {
                   <ArrowRight className="w-4 h-4 rtl:rotate-180" />
                 </div>
               </div>
+
+              {/* VIP Membership Card (Google Play Billing: vip_monthly) */}
+              <button
+                type="button"
+                onClick={() => openVipModal('general')}
+                className={`w-full p-4 rounded-2xl border transition-colors flex items-center justify-between gap-3 text-start ${
+                  vipSnap.isVip
+                    ? 'bg-emerald-950/35 border-emerald-500/45 hover:border-emerald-400'
+                    : 'bg-gradient-to-r from-amber-500/15 via-slate-900 to-amber-500/10 border-amber-500/50 hover:border-amber-400'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 text-slate-950 flex items-center justify-center shrink-0 shadow-md shadow-amber-500/20">
+                    <Crown className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="font-black text-sm text-amber-300 flex items-center gap-2">
+                      <span>
+                        {vipSnap.isVip
+                          ? lang === 'ar'
+                            ? 'عضوية VIP مفعّلة'
+                            : 'VIP Membership Active'
+                          : lang === 'ar'
+                          ? 'العضوية المميزة (VIP) — اشترك الآن'
+                          : 'VIP Membership — Subscribe Now'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-0.5 truncate">
+                      {vipSnap.isVip
+                        ? lang === 'ar'
+                          ? 'الميكروفون والكاميرا مفتوحان · بدون إعلانات · محفوظ في قاعدة البيانات'
+                          : 'Mic & Camera unlocked · Ad-Free · Saved to Database'
+                        : lang === 'ar'
+                        ? 'افتح المايك والكاميرا والغِ الإعلانات نهائياً عبر باقة vip_monthly'
+                        : 'Unlock live Mic & Camera and remove all ads with vip_monthly'}
+                    </p>
+                  </div>
+                </div>
+                <span className="shrink-0 text-xs font-black text-amber-300 whitespace-nowrap">
+                  {vipSnap.isVip
+                    ? lang === 'ar'
+                      ? 'عرض التفاصيل'
+                      : 'Details'
+                    : lang === 'ar'
+                    ? 'اشترك الآن ←'
+                    : 'Subscribe →'}
+                </span>
+              </button>
+
+              {/* Ad Banner (Hidden completely when player is VIP) */}
+              <AdBanner
+                isVip={vipSnap.isVip}
+                lang={lang}
+                onUpgradeVip={() => openVipModal('remove_ads')}
+              />
             </div>
 
             {/* Utility links */}
@@ -1415,6 +1491,17 @@ export default function App() {
             <div className="hidden lg:block shrink-0">
               <LadderPanel currentLevel={currentLevel} lang={lang} />
             </div>
+          </div>
+        )}
+
+        {/* Non-VIP Ad Slot during Classic Play (Auto-removed when VIP is active) */}
+        {gameMode === 'classic' && gameStatus !== 'lobby' && !vipSnap.isVip && (
+          <div className="mt-5">
+            <AdBanner
+              isVip={vipSnap.isVip}
+              lang={lang}
+              onUpgradeVip={() => openVipModal('remove_ads')}
+            />
           </div>
         )}
       </main>
@@ -1653,6 +1740,8 @@ export default function App() {
           setPrivateRoomId(id);
           setActiveCallRoomId(id);
         }}
+        isVip={vipSnap.isVip}
+        onOpenVip={() => openVipModal('mic_camera')}
       />
 
       {/* Persistent Global Auto-Mic & Video/Voice Call Dock Across ALL Stages */}
@@ -1662,6 +1751,8 @@ export default function App() {
         onOpenRoomsModal={() => {
           void verifyInternetBeforeOnline(() => setIsRoomsModalOpen(true));
         }}
+        isVip={vipSnap.isVip}
+        onOpenVip={() => openVipModal('mic_camera')}
       />
 
       {/* Microphone Permissions Screen BEFORE Entering 1v1 or 4-Player Rooms */}
@@ -1673,6 +1764,8 @@ export default function App() {
             ? (lang === 'ar' ? 'تحدي 4 لاعبين أونلاين' : '4-Player Online Arena')
             : (lang === 'ar' ? 'تحدي ثنائي (1 ضد 1)' : '1v1 Friend Duel')
         }
+        isVip={vipSnap.isVip}
+        onOpenVip={() => openVipModal('mic_camera')}
         onCancel={() => setPendingMultiplayerEntry(null)}
         onContinue={() => {
           const entry = pendingMultiplayerEntry;
@@ -1691,6 +1784,14 @@ export default function App() {
           setMultiplayerMatchType(entry.matchType);
           setGameMode('multiplayer4');
         }}
+      />
+
+      {/* Official VIP Membership Screen (Google Play Billing Library: vip_monthly) */}
+      <VipMembershipModal
+        isOpen={isVipModalOpen}
+        onClose={() => setIsVipModalOpen(false)}
+        lang={lang}
+        reason={vipModalReason}
       />
 
       {/* Offline Modal Shown ONLY When Clicking Online / Duel / Call While Disconnected */}
