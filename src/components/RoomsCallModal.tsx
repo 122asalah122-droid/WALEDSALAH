@@ -34,6 +34,11 @@ import {
   sendRoomMessage,
   deleteRoomMessage,
 } from '../services/firebaseRoomService';
+import {
+  vipBillingService,
+  VipServiceSnapshot,
+  VIDEO_QUOTA_LIMIT_MINUTES,
+} from '../services/vipBillingService';
 
 interface RoomsCallModalProps {
   isOpen: boolean;
@@ -65,6 +70,7 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
   const [showBlockedList, setShowBlockedList] = useState<boolean>(false);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
   const [snap, setSnap] = useState<RtcSnapshot>(() => rtcCallManager.getSnapshot());
+  const [vipSnap, setVipSnap] = useState<VipServiceSnapshot>(() => vipBillingService.getSnapshot());
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
 
@@ -77,6 +83,10 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
 
   useEffect(() => {
     return rtcCallManager.subscribe(setSnap);
+  }, []);
+
+  useEffect(() => {
+    return vipBillingService.subscribe(setVipSnap);
   }, []);
 
   useEffect(() => {
@@ -419,16 +429,34 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
                       onOpenVip?.();
                       return;
                     }
+                    if (!vipBillingService.canUseCamera()) {
+                      vipBillingService.setQuotaAlert(lang);
+                      return;
+                    }
                     rtcCallManager.startCall(selectedRoomId, 'video');
                   }}
                   className={`px-3 py-2 rounded-xl font-black text-xs flex items-center gap-1.5 shadow ${
-                    isVip
-                      ? 'bg-blue-600 hover:bg-blue-500 text-white'
-                      : 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300'
+                    !isVip
+                      ? 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300'
+                      : vipSnap.videoQuotaExhausted
+                      ? 'bg-slate-800 border border-rose-500/50 text-rose-300'
+                      : 'bg-blue-600 hover:bg-blue-500 text-white'
                   }`}
                 >
                   {isVip ? <Video className="w-4 h-4" /> : <Crown className="w-4 h-4" />}
-                  <span>{isVip ? (lang === 'ar' ? 'مكالمة فيديو' : 'Video Call') : (lang === 'ar' ? 'فيديو VIP' : 'VIP Video')}</span>
+                  <span>
+                    {!isVip
+                      ? lang === 'ar'
+                        ? 'فيديو VIP'
+                        : 'VIP Video'
+                      : vipSnap.videoQuotaExhausted
+                      ? lang === 'ar'
+                        ? 'انتهى رصيد الكاميرا'
+                        : 'Camera Limit Used'
+                      : lang === 'ar'
+                      ? `مكالمة فيديو (${vipSnap.videoRemainingMinutes} د)`
+                      : `Video (${vipSnap.videoRemainingMinutes}m)`}
+                  </span>
                 </button>
                 <button
                   onClick={() => {
@@ -451,6 +479,35 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
             )}
           </div>
         </div>
+
+        {/* VIP Monthly Camera Quota Status Strip (Voice Mic & Chat remain unlimited) */}
+        {isVip && (
+          <div className="px-3 py-2 bg-slate-950/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+            <span className="text-slate-300 font-semibold">
+              {lang === 'ar'
+                ? `رصيد الكاميرا الشهري: ${vipSnap.videoRemainingMinutes} / ${VIDEO_QUOTA_LIMIT_MINUTES} دقيقة · المايك والدردشة بلا حدود`
+                : `Monthly Camera: ${vipSnap.videoRemainingMinutes} / ${VIDEO_QUOTA_LIMIT_MINUTES} min · Voice & Chat Unlimited`}
+            </span>
+            <span className="text-slate-400 font-mono tabular-nums">
+              {lang === 'ar'
+                ? `تجدد: ${new Date(vipSnap.videoQuotaResetAt).toLocaleDateString('ar-EG', { month: 'short', day: 'numeric' })}`
+                : `Renews: ${new Date(vipSnap.videoQuotaResetAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}
+            </span>
+          </div>
+        )}
+
+        {vipSnap.quotaAlertMessage && (
+          <div className="px-3 py-2.5 bg-rose-950/60 border-b border-rose-500/40 flex items-center justify-between gap-2 text-xs text-rose-200">
+            <span>{vipSnap.quotaAlertMessage}</span>
+            <button
+              type="button"
+              onClick={() => vipBillingService.clearQuotaAlert()}
+              className="px-2 py-1 rounded-lg bg-slate-900 text-slate-300 hover:text-white text-[11px] font-bold shrink-0"
+            >
+              {lang === 'ar' ? 'حسناً' : 'OK'}
+            </button>
+          </div>
+        )}
 
         {/* Connected Devices in Room (Firebase RTDB + WebRTC Presence) with Block Caller button */}
         {roomPeers.length > 0 && (

@@ -469,7 +469,7 @@ export default function App() {
         if (!rtcCallManager.getSnapshot().inCall) {
           setIsTimerActive(true);
         }
-      }, 12000);
+      }, 20000);
     } else {
       setIsTimerActive(true);
     }
@@ -625,9 +625,6 @@ export default function App() {
   // Advance to Next Question with Guaranteed Zero Repetition & Category Filter
   const handleNextQuestion = () => {
     speechService.stop();
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
 
     if (autoNextTimeoutRef.current) {
       clearTimeout(autoNextTimeoutRef.current);
@@ -665,7 +662,7 @@ export default function App() {
       });
       setTimeout(() => {
         if (!rtcCallManager.getSnapshot().inCall) setIsTimerActive(true);
-      }, 12000);
+      }, 20000);
     } else {
       setIsTimerActive(true);
     }
@@ -1264,11 +1261,11 @@ export default function App() {
                     <p className="text-xs text-slate-400 mt-0.5 truncate">
                       {vipSnap.isVip
                         ? lang === 'ar'
-                          ? 'الميكروفون والكاميرا مفتوحان · بدون إعلانات · محفوظ في قاعدة البيانات'
-                          : 'Mic & Camera unlocked · Ad-Free · Saved to Database'
+                          ? `المايك مفتوح بلا حدود · متبقي ${vipSnap.videoRemainingMinutes} د كاميرا هذا الشهر · بدون إعلانات`
+                          : `Unlimited Mic · ${vipSnap.videoRemainingMinutes}m camera left this month · Ad-Free`
                         : lang === 'ar'
-                        ? 'افتح المايك والكاميرا والغِ الإعلانات نهائياً عبر باقة vip_monthly'
-                        : 'Unlock live Mic & Camera and remove all ads with vip_monthly'}
+                        ? 'باقات شهرية / 3 شهور / سنوية — مايك بلا حدود، 120 د كاميرا شهرياً، بدون إعلانات'
+                        : 'Monthly / 3-Month / Yearly plans — Unlimited Mic, 120m/mo Camera, Ad-Free'}
                     </p>
                   </div>
                 </div>
@@ -1439,6 +1436,7 @@ export default function App() {
               ) : (
                 <QuestionCard
                   question={currentQuestion}
+                  currentLevel={currentLevel}
                   selectedIndex={selectedOption}
                   onSelectOption={handleSelectOption}
                   gameStatus={gameStatus}

@@ -6,6 +6,7 @@ import { speechService } from '../utils/speechService';
 
 interface QuestionCardProps {
   question: Question;
+  currentLevel?: number;
   selectedIndex: number | null;
   onSelectOption: (index: number) => void;
   gameStatus: GameStatus;
@@ -15,12 +16,14 @@ interface QuestionCardProps {
 
 export const QuestionCard: React.FC<QuestionCardProps> = ({
   question,
+  currentLevel,
   selectedIndex,
   onSelectOption,
   gameStatus,
   eliminatedOptions,
   lang,
 }) => {
+  const activeLevel = currentLevel || question.level || 1;
   const [copied, setCopied] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(speechService.getIsSpeaking());
   const [autoRead, setAutoRead] = useState(speechService.getAutoRead());
@@ -50,22 +53,12 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
     }
   }, [selectedIndex, isRevealed]);
 
-  // Auto-read on new question arrival if enabled
-  useEffect(() => {
-    if (autoRead && gameStatus === 'playing' && selectedIndex === null) {
-      const timer = setTimeout(() => {
-        speechService.speakQuestionAndOptions(question.level, questionText, options, lang);
-      }, 350);
-      return () => clearTimeout(timer);
-    }
-  }, [question.id, autoRead, gameStatus, lang]);
-
   const handleToggleSpeak = () => {
     sounds.playSelectAnswer();
     if (isSpeaking) {
       speechService.stop();
     } else {
-      speechService.speakQuestionAndOptions(question.level, questionText, options, lang);
+      speechService.speakQuestionAndOptions(activeLevel, questionText, options, lang);
     }
   };
 
@@ -75,7 +68,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
     setAutoRead(nextVal);
     speechService.setAutoRead(nextVal);
     if (nextVal && !isSpeaking && gameStatus === 'playing') {
-      speechService.speakQuestionAndOptions(question.level, questionText, options, lang);
+      speechService.speakQuestionAndOptions(activeLevel, questionText, options, lang);
     }
   };
 
@@ -152,7 +145,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
             ) : (
               <>
                 <Volume2 className="w-3.5 h-3.5 text-blue-400" />
-                <span>{lang === 'ar' ? 'صوت الذكاء الاصطناعي' : 'AI Voice'}</span>
+                <span>{lang === 'ar' ? 'ناطق الأسئلة' : 'Read Question'}</span>
               </>
             )}
           </button>

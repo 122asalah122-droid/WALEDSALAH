@@ -16,6 +16,7 @@ import {
   Flag,
 } from 'lucide-react';
 import { rtcCallManager, RtcSnapshot, RemotePeerStream } from '../services/rtcCallManager';
+import { vipBillingService, VipServiceSnapshot } from '../services/vipBillingService';
 import { Language } from '../types/game';
 import { sounds } from '../utils/soundEffects';
 import { ReportPlayerModal, ReportTarget } from './ReportPlayerModal';
@@ -161,6 +162,7 @@ const RemoteMediaTile: React.FC<{
 // Active Private Call Floating Stage & Incoming Call Card (NO bottom dock bar)
 export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false, onOpenVip }) => {
   const [snap, setSnap] = useState<RtcSnapshot>(() => rtcCallManager.getSnapshot());
+  const [vipSnap, setVipSnap] = useState<VipServiceSnapshot>(() => vipBillingService.getSnapshot());
   const [videoExpanded, setVideoExpanded] = useState<boolean>(true);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -174,6 +176,44 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false,
       }
     });
   }, []);
+
+  useEffect(() => {
+    return vipBillingService.subscribe(setVipSnap);
+  }, []);
+
+  // Live 120-Minute Monthly Camera Quota Enforcement (Voice Mic & Chat remain unlimited)
+  useEffect(() => {
+    if (!snap.inCall || !snap.camOn || !isVip) return;
+
+    // Immediate guard if camera turned on with 0 remaining seconds
+    if (!vipBillingService.canUseCamera()) {
+      vipBillingService.setQuotaAlert(lang);
+      void rtcCallManager.forceDisableCamera(
+        lang === 'ar'
+          ? 'انتهى رصيد الكاميرا الشهري (120 دقيقة) — المكالمة الصوتية مستمرة'
+          : 'Monthly 120-min camera limit reached — Voice call active'
+      );
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      const res = vipBillingService.consumeVideoSeconds(1, { lang });
+      if (res.exhausted) {
+        window.clearInterval(timer);
+        void rtcCallManager.forceDisableCamera(
+          lang === 'ar'
+            ? 'انتهى رصيد الكاميرا الشهري (120 دقيقة) — المكالمة الصوتية مستمرة'
+            : 'Monthly 120-min camera limit reached — Voice call active'
+        );
+      }
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+      // Flush accumulated video usage to Firebase RTDB whenever camera turns off or call ends
+      vipBillingService.consumeVideoSeconds(0, { flushToFirebase: true, lang });
+    };
+  }, [snap.inCall, snap.camOn, isVip, lang]);
 
   useEffect(() => {
     const el = localVideoRef.current;
@@ -200,7 +240,7 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false,
 
   const showStage = snap.inCall && videoExpanded;
 
-  if (!snap.inCall && !snap.incomingCall) {
+  if (!snap.inCall && !snap.incomingCall && !vipSnap.quotaAlertMessage) {
     return null;
   }
 
@@ -288,6 +328,13 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false,
                   onOpenVip?.();
                   return;
                 }
+                if (snap.incomingCall?.callMode === 'video' && !vipBillingService.canUseCamera()) {
+                  vipBillingService.setQuotaAlert(lang);
+                  const roomId = snap.incomingCall.roomId;
+                  rtcCallManager.rejectIncomingCall();
+                  void rtcCallManager.startCall(roomId, 'audio');
+                  return;
+                }
                 rtcCallManager.acceptIncomingCall();
               }}
               className="py-2 px-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs flex items-center justify-center gap-1 transition active:scale-95"
@@ -372,10 +419,28 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false,
                     onOpenVip?.();
                     return;
                   }
+                  if (!snap.camOn && !vipBillingService.canUseCamera()) {
+                    vipBillingService.setQuotaAlert(lang);
+                    return;
+                  }
                   rtcCallManager.toggleCamera();
                 }}
-                className={`p-1.5 rounded-lg border ${snap.camOn ? 'bg-blue-500/20 border-blue-400 text-blue-300' : 'bg-slate-900 border-slate-700 text-slate-300'}`}
-                title={lang === 'ar' ? 'تشغيل/إيقاف الكاميرا' : 'Toggle Camera'}
+                className={`p-1.5 rounded-lg border ${
+                  snap.camOn
+                    ? 'bg-blue-500/20 border-blue-400 text-blue-300'
+                    : vipSnap.videoQuotaExhausted
+                    ? 'bg-rose-950/60 border-rose-500/50 text-rose-300'
+                    : 'bg-slate-900 border-slate-700 text-slate-300'
+                }`}
+                title={
+                  vipSnap.videoQuotaExhausted
+                    ? lang === 'ar'
+                      ? 'انتهى رصيد الكاميرا الشهري (120 دقيقة)'
+                      : 'Monthly 120-min camera allowance exhausted'
+                    : lang === 'ar'
+                    ? 'تشغيل/إيقاف الكاميرا'
+                    : 'Toggle Camera'
+                }
               >
                 {snap.camOn ? <Video className="w-3.5 h-3.5" /> : <VideoOff className="w-3.5 h-3.5" />}
               </button>
@@ -411,6 +476,23 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false,
               </button>
             </div>
           </div>
+
+          {isVip && (
+            <div className="flex items-center justify-between gap-2 text-[11px] bg-slate-900/90 rounded-lg py-1 px-2.5 border border-slate-800">
+              <span className="text-slate-300">
+                {lang === 'ar' ? 'رصيد الكاميرا الشهري:' : 'Monthly Camera Left:'}
+              </span>
+              <span
+                className={`font-mono font-bold tabular-nums ${
+                  vipSnap.videoQuotaExhausted ? 'text-rose-400' : 'text-amber-300'
+                }`}
+              >
+                {lang === 'ar'
+                  ? `${vipSnap.videoRemainingMinutes} دقيقة متبقية`
+                  : `${vipSnap.videoRemainingMinutes} min left`}
+              </span>
+            </div>
+          )}
 
           {snap.callStatusText && (
             <div className="text-[11px] text-slate-300 text-center bg-slate-900/90 rounded-lg py-1 px-2 border border-slate-800">
@@ -476,6 +558,28 @@ export const LiveCallDock: React.FC<LiveCallDockProps> = ({ lang, isVip = false,
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Monthly Camera Quota Exhausted / Auto-Renewal Notice */}
+      {vipSnap.quotaAlertMessage && (
+        <div
+          className="fixed top-20 inset-x-3 sm:left-1/2 sm:-translate-x-1/2 sm:w-full sm:max-w-md z-[96] bg-slate-900 border-2 border-amber-500/60 rounded-2xl p-4 shadow-2xl text-start space-y-2.5 animate-fadeIn"
+          dir={lang === 'ar' ? 'rtl' : 'ltr'}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-black text-amber-300">
+              {lang === 'ar' ? 'تنبيه رصيد الكاميرا الشهري (120 دقيقة)' : 'Monthly Camera Limit Notice (120 min)'}
+            </span>
+            <button
+              type="button"
+              onClick={() => vipBillingService.clearQuotaAlert()}
+              className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-300 hover:text-white text-[11px] font-bold"
+            >
+              {lang === 'ar' ? 'إغلاق' : 'Dismiss'}
+            </button>
+          </div>
+          <p className="text-xs text-slate-200 leading-relaxed">{vipSnap.quotaAlertMessage}</p>
         </div>
       )}
 

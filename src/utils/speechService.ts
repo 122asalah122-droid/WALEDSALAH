@@ -139,7 +139,7 @@ class SpeechService {
     }
   }
 
-  // Pre-warms and unlocks mobile audio restriction on first user touch/click
+  // Pre-warms voices and resumes paused speechSynthesis on user touch/click without queuing a colliding utterance
   public prime() {
     if (typeof window === 'undefined') return;
     try {
@@ -148,13 +148,6 @@ class SpeechService {
           window.speechSynthesis.resume();
         }
         this.initVoices();
-        if (!this.isPrimed) {
-          const dummy = new SpeechSynthesisUtterance(' ');
-          dummy.volume = 0.01;
-          dummy.rate = 1.5;
-          (window as unknown as { __currentUtterance?: SpeechSynthesisUtterance }).__currentUtterance = dummy;
-          window.speechSynthesis.speak(dummy);
-        }
       }
       this.isPrimed = true;
     } catch {}
@@ -245,19 +238,19 @@ class SpeechService {
         if (window.speechSynthesis.paused) {
           window.speechSynthesis.resume();
         }
-        window.speechSynthesis.cancel();
+        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+          window.speechSynthesis.cancel();
+        }
       } catch {}
       try {
         delete (window as unknown as { __currentUtterance?: SpeechSynthesisUtterance }).__currentUtterance;
       } catch {}
-      setTimeout(() => {
-        try {
-          if ('speechSynthesis' in window) {
-            window.speechSynthesis.cancel();
-          }
-        } catch {}
-      }, 25);
     }
+
+    try {
+      const androidTts = (window as unknown as { AndroidTTS?: { stop?: () => void } }).AndroidTTS;
+      androidTts?.stop?.();
+    } catch {}
 
     this.isSpeaking = false;
     this.currentQuestionKey = '';
@@ -346,17 +339,49 @@ class SpeechService {
       return;
     }
 
+    const wasBusy =
+      typeof window !== 'undefined' &&
+      'speechSynthesis' in window &&
+      (window.speechSynthesis.speaking || window.speechSynthesis.pending);
+
     this.stop();
     const token = ++this.speechToken;
     this.currentQuestionKey = questionKey;
 
     const formattedText = this.buildDramaticText(level, questionText, options, lang);
 
+    // Optional native Android WebView TTS bridge if attached by wrapper app
+    try {
+      const androidTts = (
+        window as unknown as {
+          AndroidTTS?: { speak?: (text: string, langCode: string) => void };
+        }
+      ).AndroidTTS;
+      if (androidTts?.speak) {
+        this.notify(true, formattedText);
+        androidTts.speak(formattedText, lang === 'ar' ? 'ar-SA' : 'en-US');
+        this.webSpeechSafetyTimeout = window.setTimeout(() => {
+          if (this.speechToken === token) {
+            this.notify(false, '');
+            this.currentQuestionKey = '';
+            if (onComplete) onComplete();
+          }
+        }, Math.min(22000, Math.max(5000, formattedText.length * 75)));
+        return;
+      }
+    } catch {}
+
     // Frontend-only Web Speech API (zero local /api/* server dependency for Cloudflare Pages & Offline PWA)
-    this.speakWithWebSpeech(formattedText, lang, token, onComplete);
+    this.speakWithWebSpeech(formattedText, lang, token, onComplete, wasBusy);
   }
 
-  private speakWithWebSpeech(formattedText: string, lang: 'ar' | 'en', token: number, onComplete?: () => void) {
+  private speakWithWebSpeech(
+    formattedText: string,
+    lang: 'ar' | 'en',
+    token: number,
+    onComplete?: () => void,
+    wasBusy: boolean = false
+  ) {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       this.notify(false, '');
       this.currentQuestionKey = '';
@@ -366,6 +391,7 @@ class SpeechService {
     if (this.speechToken !== token) return;
 
     let completed = false;
+    let started = false;
     const finishSpeech = () => {
       if (completed || this.speechToken !== token) return;
       completed = true;
@@ -376,13 +402,12 @@ class SpeechService {
       if (onComplete) onComplete();
     };
 
-    this.activeTimeout = window.setTimeout(() => {
-      if (this.speechToken !== token) return;
+    const runSpeak = () => {
+      if (this.speechToken !== token || completed) return;
       try {
         if (window.speechSynthesis.paused) {
           window.speechSynthesis.resume();
         }
-        window.speechSynthesis.cancel();
 
         if (!this.bestArabicVoice || !this.bestEnglishVoice) {
           this.initVoices();
@@ -393,8 +418,10 @@ class SpeechService {
 
         if (lang === 'ar' && this.bestArabicVoice) {
           utterance.voice = this.bestArabicVoice;
+          utterance.lang = this.bestArabicVoice.lang || 'ar-SA';
         } else if (lang === 'en' && this.bestEnglishVoice) {
           utterance.voice = this.bestEnglishVoice;
+          utterance.lang = this.bestEnglishVoice.lang || 'en-US';
         }
 
         utterance.pitch = this.voicePitch;
@@ -405,9 +432,12 @@ class SpeechService {
 
         utterance.onstart = () => {
           if (this.speechToken !== token) {
-            try { window.speechSynthesis.cancel(); } catch {}
+            try {
+              window.speechSynthesis.cancel();
+            } catch {}
             return;
           }
+          started = true;
           this.notify(true, formattedText);
         };
 
@@ -419,32 +449,53 @@ class SpeechService {
           finishSpeech();
         };
 
-        // Prevent Chrome / Android WebView mid-sentence freeze bug
+        // Prevent Chrome / Android WebView mid-sentence freeze bug & nudge paused engine
         this.speechKeepAliveInterval = window.setInterval(() => {
           if (this.speechToken !== token) {
             this.clearSpeechWatchdogs();
             return;
           }
           try {
-            if (window.speechSynthesis.speaking && window.speechSynthesis.paused) {
+            if (window.speechSynthesis.paused) {
               window.speechSynthesis.resume();
             }
           } catch {}
-        }, 2500);
+        }, 1200);
 
         // Hard cap safety net if Web Speech silently hangs without firing onend
         this.webSpeechSafetyTimeout = window.setTimeout(() => {
           if (!completed && this.speechToken === token) {
-            try { window.speechSynthesis.cancel(); } catch {}
+            try {
+              window.speechSynthesis.cancel();
+            } catch {}
             finishSpeech();
           }
-        }, 14000);
+        }, started ? 28000 : 22000);
 
+        // Mark speaking immediately so UI banner & state stay responsive even on engines that fire onstart late
+        this.notify(true, formattedText);
         window.speechSynthesis.speak(utterance);
+
+        // Kickstart Chromium/WebView if it starts in a paused queue state
+        this.audioWatchdogTimeout = window.setTimeout(() => {
+          if (this.speechToken !== token || completed) return;
+          try {
+            if (window.speechSynthesis.paused) {
+              window.speechSynthesis.resume();
+            }
+          } catch {}
+        }, 300);
       } catch {
         finishSpeech();
       }
-    }, 40);
+    };
+
+    // Preserve user click gesture synchronously when engine was idle; only wait briefly after canceling active speech
+    if (wasBusy) {
+      this.activeTimeout = window.setTimeout(runSpeak, 80);
+    } else {
+      runSpeak();
+    }
   }
 }
 

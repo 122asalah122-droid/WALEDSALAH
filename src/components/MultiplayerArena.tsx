@@ -1348,8 +1348,10 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
 
     const isCorrect = idx === currentQuestion.correctIndex;
 
-    // On wrong answer: if player has >= 50 pts, ask whether they want to deduct 50 pts to continue!
-    if (!isCorrect && userPoints >= 50) {
+    // On wrong answer:
+    // - In 1v1 Duel: always show the modal with "مواصلة (خصم 50 نقطة)" or "انسحاب"
+    // - In 4-Player mode: show revival prompt if player has >= 50 pts
+    if (!isCorrect && (matchType === '1v1_friend' || userPoints >= 50)) {
       sounds.playWrong();
       setWrongAttemptFlash(idx);
       setTimeout(() => setWrongAttemptFlash(null), 900);
@@ -1541,9 +1543,13 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
   };
 
   const handleDeclineRevive = () => {
-    const idxToSubmit = wrongConfirmOptionIdx !== null ? wrongConfirmOptionIdx : 0;
     setIsRevivalOpen(false);
     setWrongConfirmOptionIdx(null);
+    if (matchType === '1v1_friend') {
+      handleConfirmForfeit();
+      return;
+    }
+    const idxToSubmit = wrongConfirmOptionIdx !== null ? wrongConfirmOptionIdx : 0;
     submitOptionAnswer(idxToSubmit, false);
   };
 
@@ -3023,7 +3029,11 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
             </h3>
 
             <p className="text-xs text-slate-300 leading-relaxed">
-              {lang === 'ar'
+              {matchType === '1v1_friend'
+                ? lang === 'ar'
+                  ? `رصيدك الحالي: ${userPoints} نقطة — يمكنك خصم 50 نقطة للمواصلة ومحاولة الإجابة على نفس السؤال، أو الضغط على «انسحاب» للانسحاب من التحدي.`
+                  : `Current balance: ${userPoints} pts — Spend 50 points to continue on this question, or choose Withdraw to forfeit the duel.`
+                : lang === 'ar'
                 ? `رصيدك الحالي: ${userPoints} نقطة — يمكنك خصم 50 نقطة للمواصلة ومحاولة الإجابة على نفس السؤال، أو عدم الخصم وتسجيل الإجابة الخاطئة.`
                 : `Current balance: ${userPoints} pts — Spend 50 points to continue on this question, or record the wrong answer without deducting.`}
             </p>
@@ -3031,9 +3041,19 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
             <div className="grid grid-cols-2 gap-3 pt-2">
               <button
                 onClick={handleDeclineRevive}
-                className="py-2.5 px-4 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs rounded-xl transition"
+                className={`py-2.5 px-4 font-black text-xs rounded-xl transition ${
+                  matchType === '1v1_friend'
+                    ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-lg shadow-rose-600/20'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold'
+                }`}
               >
-                {lang === 'ar' ? 'لا، أكمل بدون خصم' : 'No, Record Wrong'}
+                {matchType === '1v1_friend'
+                  ? lang === 'ar'
+                    ? 'انسحاب'
+                    : 'Withdraw'
+                  : lang === 'ar'
+                  ? 'لا، أكمل بدون خصم'
+                  : 'No, Record Wrong'}
               </button>
               <button
                 onClick={handleReviveWithPoints}

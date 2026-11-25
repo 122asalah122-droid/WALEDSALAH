@@ -1661,6 +1661,22 @@ class RtcCallManager {
     this.emit();
   }
 
+  /**
+   * Automatically shuts off only the camera (e.g. when the 120-minute monthly VIP video quota reaches 0)
+   * while keeping voice microphone and chat running uninterrupted.
+   */
+  public async forceDisableCamera(reasonText?: string): Promise<void> {
+    if (!this.camOn && this.callMode !== 'video') return;
+    this.stopCamera();
+    this.callMode = 'audio';
+    if (reasonText) {
+      this.callStatusText = reasonText;
+    }
+    this.syncTracksToAllPcs();
+    await this.publishMediaState();
+    this.emit();
+  }
+
   public async switchCamera(): Promise<void> {
     const nextFacing = this.facingMode === 'user' ? 'environment' : 'user';
     await this.acquireCamera(nextFacing);

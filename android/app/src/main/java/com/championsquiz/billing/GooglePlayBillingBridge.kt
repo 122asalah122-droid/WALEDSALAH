@@ -14,10 +14,12 @@ import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Official Google Play Billing Library v7 bridge for the Champions Challenge WebView.
+ * Official Google Play Billing Library v7 bridge for Champions Challenge WebView.
+ * Supports all 3 VIP subscription SKUs: vip_monthly, vip_3months, vip_yearly.
  *
  * Attach in MainActivity.kt:
  *   val billingBridge = GooglePlayBillingBridge(this, webView)
@@ -31,9 +33,17 @@ class GooglePlayBillingBridge(
 
     companion object {
         const val VIP_MONTHLY_PRODUCT_ID = "vip_monthly"
+        const val VIP_3MONTHS_PRODUCT_ID = "vip_3months"
+        const val VIP_YEARLY_PRODUCT_ID = "vip_yearly"
+
+        val SUPPORTED_VIP_SKUS = listOf(
+            VIP_MONTHLY_PRODUCT_ID,
+            VIP_3MONTHS_PRODUCT_ID,
+            VIP_YEARLY_PRODUCT_ID
+        )
     }
 
-    private var cachedProductDetails: ProductDetails? = null
+    private val cachedProductDetailsMap = mutableMapOf<String, ProductDetails>()
 
     private val billingClient: BillingClient = BillingClient.newBuilder(activity)
         .setListener(this)
@@ -53,7 +63,7 @@ class GooglePlayBillingBridge(
         billingClient.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(billingResult: BillingResult) {
                 if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
-                    queryVipProductDetails()
+                    queryAllVipProductDetails()
                     restorePurchases()
                     onConnected?.invoke()
                 }
@@ -75,16 +85,23 @@ class GooglePlayBillingBridge(
     fun isBillingAvailable(): Boolean = true
 
     @JavascriptInterface
-    fun getProductDetails(productId: String) {
-        val targetId = if (productId == VIP_MONTHLY_PRODUCT_ID) productId else VIP_MONTHLY_PRODUCT_ID
+    fun getAllProductDetails() {
         connect {
-            queryVipProductDetails(targetId)
+            queryAllVipProductDetails()
+        }
+    }
+
+    @JavascriptInterface
+    fun getProductDetails(productId: String) {
+        if (productId !in SUPPORTED_VIP_SKUS) return
+        connect {
+            queryAllVipProductDetails()
         }
     }
 
     @JavascriptInterface
     fun purchaseSubscription(productId: String) {
-        if (productId != VIP_MONTHLY_PRODUCT_ID) {
+        if (productId !in SUPPORTED_VIP_SKUS) {
             dispatchToWeb("purchaseError", JSONObject().apply {
                 put("productId", productId)
                 put("code", "INVALID_PRODUCT_ID")
@@ -94,18 +111,19 @@ class GooglePlayBillingBridge(
         }
 
         connect {
-            val details = cachedProductDetails
+            val details = cachedProductDetailsMap[productId]
             if (details != null) {
                 launchSubscriptionFlow(details)
             } else {
-                queryVipProductDetails(VIP_MONTHLY_PRODUCT_ID) { loaded ->
+                queryAllVipProductDetails {
+                    val loaded = cachedProductDetailsMap[productId]
                     if (loaded != null) {
                         launchSubscriptionFlow(loaded)
                     } else {
                         dispatchToWeb("purchaseError", JSONObject().apply {
-                            put("productId", VIP_MONTHLY_PRODUCT_ID)
+                            put("productId", productId)
                             put("code", "PRODUCT_NOT_FOUND")
-                            put("message", "Subscription vip_monthly was not found in Google Play Console")
+                            put("message", "Subscription $productId was not found in Google Play Console")
                         })
                     }
                 }
@@ -130,12 +148,14 @@ class GooglePlayBillingBridge(
                 }
 
                 val vipPurchase = purchases.firstOrNull { purchase ->
-                    purchase.products.contains(VIP_MONTHLY_PRODUCT_ID) &&
-                        purchase.purchaseState == Purchase.PurchaseState.PURCHASED
+                    purchase.purchaseState == Purchase.PurchaseState.PURCHASED &&
+                        purchase.products.any { it in SUPPORTED_VIP_SKUS }
                 }
 
                 if (vipPurchase != null) {
-                    acknowledgeAndNotify(vipPurchase, isRestore = true)
+                    val matchedSku = vipPurchase.products.firstOrNull { it in SUPPORTED_VIP_SKUS }
+                        ?: VIP_MONTHLY_PRODUCT_ID
+                    acknowledgeAndNotify(vipPurchase, matchedSku, isRestore = true)
                 } else {
                     dispatchToWeb("restoreResult", JSONObject().apply {
                         put("active", false)
@@ -145,43 +165,45 @@ class GooglePlayBillingBridge(
         }
     }
 
-    private fun queryVipProductDetails(
-        productId: String = VIP_MONTHLY_PRODUCT_ID,
-        callback: ((ProductDetails?) -> Unit)? = null
-    ) {
-        val productList = listOf(
+    private fun queryAllVipProductDetails(onComplete: (() -> Unit)? = null) {
+        val productList = SUPPORTED_VIP_SKUS.map { sku ->
             QueryProductDetailsParams.Product.newBuilder()
-                .setProductId(productId)
+                .setProductId(sku)
                 .setProductType(BillingClient.ProductType.SUBS)
                 .build()
-        )
+        }
 
         val params = QueryProductDetailsParams.newBuilder()
             .setProductList(productList)
             .build()
 
         billingClient.queryProductDetailsAsync(params) { billingResult, productDetailsList ->
-            val details = if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
-                productDetailsList.firstOrNull { it.productId == productId }
-            } else {
-                null
+            if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
+                val itemsArray = JSONArray()
+                productDetailsList.forEach { details ->
+                    if (details.productId in SUPPORTED_VIP_SKUS) {
+                        cachedProductDetailsMap[details.productId] = details
+                        val offer = details.subscriptionOfferDetails?.firstOrNull()
+                        val pricingPhase = offer?.pricingPhases?.pricingPhaseList?.firstOrNull()
+                        val itemJson = JSONObject().apply {
+                            put("productId", details.productId)
+                            put("title", details.name)
+                            put("description", details.description)
+                            put("formattedPrice", pricingPhase?.formattedPrice ?: "")
+                            put("currencyCode", pricingPhase?.priceCurrencyCode ?: "")
+                            put("billingPeriod", pricingPhase?.billingPeriod ?: "P1M")
+                        }
+                        itemsArray.put(itemJson)
+                        dispatchToWeb("productDetails", itemJson)
+                    }
+                }
+                if (itemsArray.length() > 0) {
+                    dispatchToWeb("productsDetails", JSONObject().apply {
+                        put("items", itemsArray)
+                    })
+                }
             }
-            cachedProductDetails = details
-
-            if (details != null) {
-                val offer = details.subscriptionOfferDetails?.firstOrNull()
-                val pricingPhase = offer?.pricingPhases?.pricingPhaseList?.firstOrNull()
-                dispatchToWeb("productDetails", JSONObject().apply {
-                    put("productId", details.productId)
-                    put("title", details.name)
-                    put("description", details.description)
-                    put("formattedPrice", pricingPhase?.formattedPrice ?: "")
-                    put("currencyCode", pricingPhase?.priceCurrencyCode ?: "")
-                    put("billingPeriod", pricingPhase?.billingPeriod ?: "P1M")
-                })
-            }
-
-            callback?.invoke(details)
+            onComplete?.invoke()
         }
     }
 
@@ -191,7 +213,7 @@ class GooglePlayBillingBridge(
             dispatchToWeb("purchaseError", JSONObject().apply {
                 put("productId", productDetails.productId)
                 put("code", "NO_OFFER_TOKEN")
-                put("message", "No active base plan offer found for vip_monthly")
+                put("message", "No active base plan offer found for ${productDetails.productId}")
             })
             return
         }
@@ -223,13 +245,17 @@ class GooglePlayBillingBridge(
     ) {
         when (billingResult.responseCode) {
             BillingClient.BillingResponseCode.OK -> {
-                val vipPurchase = purchases?.firstOrNull { it.products.contains(VIP_MONTHLY_PRODUCT_ID) }
+                val vipPurchase = purchases?.firstOrNull { purchase ->
+                    purchase.products.any { it in SUPPORTED_VIP_SKUS }
+                }
                 if (vipPurchase != null) {
+                    val matchedSku = vipPurchase.products.firstOrNull { it in SUPPORTED_VIP_SKUS }
+                        ?: VIP_MONTHLY_PRODUCT_ID
                     if (vipPurchase.purchaseState == Purchase.PurchaseState.PURCHASED) {
-                        acknowledgeAndNotify(vipPurchase, isRestore = false)
+                        acknowledgeAndNotify(vipPurchase, matchedSku, isRestore = false)
                     } else if (vipPurchase.purchaseState == Purchase.PurchaseState.PENDING) {
                         dispatchToWeb("purchasePending", JSONObject().apply {
-                            put("productId", VIP_MONTHLY_PRODUCT_ID)
+                            put("productId", matchedSku)
                             put("message", "Payment is pending confirmation from Google Play")
                         })
                     }
@@ -237,9 +263,7 @@ class GooglePlayBillingBridge(
             }
 
             BillingClient.BillingResponseCode.USER_CANCELED -> {
-                dispatchToWeb("purchaseCanceled", JSONObject().apply {
-                    put("productId", VIP_MONTHLY_PRODUCT_ID)
-                })
+                dispatchToWeb("purchaseCanceled", JSONObject())
             }
 
             BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
@@ -248,7 +272,6 @@ class GooglePlayBillingBridge(
 
             else -> {
                 dispatchToWeb("purchaseError", JSONObject().apply {
-                    put("productId", VIP_MONTHLY_PRODUCT_ID)
                     put("code", billingResult.responseCode.toString())
                     put("message", billingResult.debugMessage)
                 })
@@ -256,11 +279,11 @@ class GooglePlayBillingBridge(
         }
     }
 
-    private fun acknowledgeAndNotify(purchase: Purchase, isRestore: Boolean) {
+    private fun acknowledgeAndNotify(purchase: Purchase, matchedSku: String, isRestore: Boolean) {
         val sendSuccess = {
             dispatchToWeb(if (isRestore) "restoreResult" else "purchaseSuccess", JSONObject().apply {
                 put("active", true)
-                put("productId", VIP_MONTHLY_PRODUCT_ID)
+                put("productId", matchedSku)
                 put("orderId", purchase.orderId ?: "")
                 put("purchaseToken", purchase.purchaseToken)
                 put("purchaseTime", purchase.purchaseTime)
@@ -283,7 +306,7 @@ class GooglePlayBillingBridge(
                 sendSuccess()
             } else {
                 dispatchToWeb("purchaseError", JSONObject().apply {
-                    put("productId", VIP_MONTHLY_PRODUCT_ID)
+                    put("productId", matchedSku)
                     put("code", "ACKNOWLEDGE_FAILED")
                     put("message", ackResult.debugMessage)
                 })
