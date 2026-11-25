@@ -10,7 +10,6 @@ import {
   RefreshCw,
   AlertCircle,
   Database,
-  LockOpen,
   Clock,
 } from 'lucide-react';
 import { Language } from '../types/game';
@@ -20,8 +19,6 @@ import {
   VipPlanSku,
   VIP_3MONTHS_SKU,
   VIDEO_QUOTA_LIMIT_MINUTES,
-  computeThreeInstallments,
-  getPlanNumericAmount,
 } from '../services/vipBillingService';
 import { sounds } from '../utils/soundEffects';
 
@@ -43,7 +40,6 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
   const [snap, setSnap] = useState<VipServiceSnapshot>(() => vipBillingService.getSnapshot());
   const [selectedSku, setSelectedSku] = useState<VipPlanSku>(VIP_3MONTHS_SKU);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'info' | 'error'; text: string } | null>(null);
-  const [showPlayNotice, setShowPlayNotice] = useState(false);
 
   useEffect(() => {
     return vipBillingService.subscribe(setSnap);
@@ -54,7 +50,6 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
       vipBillingService.ensureQuotaCycleFresh();
     } else {
       setFeedback(null);
-      setShowPlayNotice(false);
     }
   }, [isOpen]);
 
@@ -67,17 +62,6 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
     if (plan.livePrice) return plan.livePrice;
     return lang === 'ar' ? plan.fallbackPriceAr : plan.fallbackPriceEn;
   };
-
-  const formatAmount = (amount: number, currency = 'EGP') => {
-    if (lang === 'ar') {
-      return currency === 'EGP' ? `${amount} جنيه` : `${amount} ${currency}`;
-    }
-    return `${amount} ${currency}`;
-  };
-
-  const selectedPlanTotal = getPlanNumericAmount(selectedPlan);
-  const selectedPlanCurrency = selectedPlan.liveCurrency || selectedPlan.fallbackCurrency || 'EGP';
-  const selectedInstallments = computeThreeInstallments(selectedPlanTotal);
 
   const celebrateVipSuccess = () => {
     try {
@@ -94,7 +78,6 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
   const handleSubscribe = async () => {
     if (snap.isLoading) return;
     setFeedback(null);
-    setShowPlayNotice(false);
     sounds.playSelectAnswer();
 
     const result = await vipBillingService.purchaseVipPlan(selectedSku);
@@ -132,13 +115,12 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
     }
 
     if (result.requiresPlayApp) {
-      setShowPlayNotice(true);
       setFeedback({
         type: 'info',
         text:
           lang === 'ar'
-            ? 'الدفع الحقيقي عبر مكتبة Google Play Billing يعمل داخل تطبيق الأندرويد المثبّت من متجر Google Play.'
-            : 'Live Google Play Billing purchases run inside the Android app installed from Google Play.',
+            ? 'الدفع يتم حصرياً عبر متجر Google Play (Google Play Billing) داخل تطبيق الأندرويد المثبّت من المتجر.'
+            : 'Payments are processed exclusively via Google Play Billing inside the Android app installed from Google Play.',
       });
       return;
     }
@@ -176,43 +158,6 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
           lang === 'ar'
             ? 'لم يتم العثور على اشتراك VIP نشط مرتبط بهذا الحساب حالياً.'
             : 'No active VIP subscription was found for this account.',
-      });
-    }
-  };
-
-  const handleSandboxTestUnlock = async () => {
-    if (snap.isLoading) return;
-    setFeedback(null);
-    const ok = await vipBillingService.activateSandboxPreviewVip(selectedSku);
-    if (ok) {
-      celebrateVipSuccess();
-      setShowPlayNotice(false);
-      setFeedback({
-        type: 'success',
-        text:
-          lang === 'ar'
-            ? `تم سداد الدفعة الأولى (${formatAmount(selectedInstallments[0], selectedPlanCurrency)}) من 3 دفعات لباقة (${selectedPlan.titleAr}) وحفظ isVIP: true في Firebase!`
-            : `Installment 1 of 3 (${formatAmount(selectedInstallments[0], selectedPlanCurrency)}) for ${selectedPlan.titleEn} saved to Firebase!`,
-      });
-      onVipActivated?.();
-    }
-  };
-
-  const handlePayNextInstallment = async () => {
-    if (snap.isLoading) return;
-    sounds.playSelectAnswer();
-    const res = await vipBillingService.payNextInstallment();
-    if (res.success) {
-      celebrateVipSuccess();
-      setFeedback({
-        type: 'success',
-        text: res.completed
-          ? lang === 'ar'
-            ? 'تم سداد الدفعة الثالثة والأخيرة بنجاح (3 / 3 دفعات مكتملة) وحفظها في Firebase!'
-            : 'Final installment paid (3 / 3 installments complete) and synced to Firebase!'
-          : lang === 'ar'
-          ? `تم سداد الدفعة رقم ${res.paidNumber} من 3 دفعات بنجاح وحفظها في Firebase!`
-          : `Installment ${res.paidNumber} of 3 paid successfully and saved to Firebase!`,
       });
     }
   };
@@ -363,175 +308,71 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
                   </span>
                 </div>
               </div>
-
-              {/* 3-Installment Payment Progress */}
-              {snap.installmentPlan && (
-                <div className="pt-3 border-t border-emerald-500/20 space-y-2.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-slate-200 font-bold">
-                      {lang === 'ar' ? 'خطة الدفع على 3 دفعات:' : '3-Installment Payment Plan:'}
-                    </span>
-                    <span className="font-mono font-black text-emerald-300 tabular-nums">
-                      {lang === 'ar'
-                        ? `${snap.installmentPlan.paidInstallments} / 3 دفعات`
-                        : `${snap.installmentPlan.paidInstallments} / 3 paid`}
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2">
-                    {snap.installmentPlan.schedule.map((inst) => (
-                      <div
-                        key={inst.number}
-                        className={`p-2 rounded-xl border text-center ${
-                          inst.status === 'paid'
-                            ? 'bg-emerald-500/15 border-emerald-500/45 text-emerald-200'
-                            : 'bg-slate-950/70 border-slate-800 text-slate-300'
-                        }`}
-                      >
-                        <div className="text-[10px] font-bold">
-                          {lang === 'ar' ? `الدفعة ${inst.number}` : `Part ${inst.number}`}
-                        </div>
-                        <div className="text-xs font-black font-mono tabular-nums mt-0.5">
-                          {formatAmount(inst.amount, snap.installmentPlan?.currency)}
-                        </div>
-                        <div className="text-[10px] mt-0.5 opacity-80">
-                          {inst.status === 'paid'
-                            ? lang === 'ar'
-                              ? 'مدفوعة ✓'
-                              : 'Paid ✓'
-                            : new Date(inst.dueAt).toLocaleDateString(lang === 'ar' ? 'ar-EG' : 'en-US', {
-                                month: 'short',
-                                day: 'numeric',
-                              })}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  {snap.installmentPlan.paidInstallments < 3 && (
-                    <button
-                      type="button"
-                      onClick={handlePayNextInstallment}
-                      className="w-full py-2 px-3 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/45 text-amber-200 font-bold text-xs transition-colors"
-                    >
-                      {lang === 'ar'
-                        ? `سداد الدفعة التالية (${snap.installmentPlan.paidInstallments + 1} من 3)`
-                        : `Pay Next Installment (${snap.installmentPlan.paidInstallments + 1} of 3)`}
-                    </button>
-                  )}
-                </div>
-              )}
             </div>
           ) : (
-            /* 3 Subscription Plans Selector (Each payable in 3 Installments) */
-            <div className="space-y-3">
-              <div className="space-y-2.5" role="radiogroup" aria-label={lang === 'ar' ? 'باقات الاشتراك' : 'Subscription Plans'}>
-                {snap.plans.map((plan) => {
-                  const isSelected = selectedSku === plan.sku;
-                  const priceLabel = getDisplayPrice(plan);
-                  const periodLabel = lang === 'ar' ? plan.periodLabelAr : plan.periodLabelEn;
-                  const planTotal = getPlanNumericAmount(plan);
-                  const planCurrency = plan.liveCurrency || plan.fallbackCurrency || 'EGP';
-                  const [firstPart] = computeThreeInstallments(planTotal);
-                  return (
-                    <button
-                      key={plan.sku}
-                      type="button"
-                      role="radio"
-                      aria-checked={isSelected}
-                      onClick={() => {
-                        sounds.playSelectAnswer();
-                        setSelectedSku(plan.sku);
-                      }}
-                      className={`w-full min-h-[68px] p-4 rounded-2xl border text-start transition-colors flex items-center justify-between gap-3 ${
-                        isSelected
-                          ? 'bg-amber-500/15 border-amber-400 ring-1 ring-amber-400/60'
-                          : 'bg-slate-950/85 border-slate-800 hover:border-slate-700'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <span
-                          className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${
-                            isSelected ? 'border-amber-400 bg-amber-400' : 'border-slate-600'
-                          }`}
-                        >
-                          {isSelected && <span className="w-2 h-2 rounded-full bg-slate-950" />}
-                        </span>
-                        <div className="min-w-0 space-y-0.5">
-                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                            <span className="text-sm sm:text-base font-black text-slate-100">
-                              {lang === 'ar' ? plan.titleAr : plan.titleEn}
+            /* 3 Subscription Plans Selector (Full One-Time Payment per Plan) */
+            <div className="space-y-2.5" role="radiogroup" aria-label={lang === 'ar' ? 'باقات الاشتراك' : 'Subscription Plans'}>
+              {snap.plans.map((plan) => {
+                const isSelected = selectedSku === plan.sku;
+                const priceLabel = getDisplayPrice(plan);
+                const periodLabel = lang === 'ar' ? plan.periodLabelAr : plan.periodLabelEn;
+                return (
+                  <button
+                    key={plan.sku}
+                    type="button"
+                    role="radio"
+                    aria-checked={isSelected}
+                    onClick={() => {
+                      sounds.playSelectAnswer();
+                      setSelectedSku(plan.sku);
+                    }}
+                    className={`w-full min-h-[68px] p-4 rounded-2xl border text-start transition-colors flex items-center justify-between gap-3 ${
+                      isSelected
+                        ? 'bg-amber-500/15 border-amber-400 ring-1 ring-amber-400/60'
+                        : 'bg-slate-950/85 border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <span
+                        className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${
+                          isSelected ? 'border-amber-400 bg-amber-400' : 'border-slate-600'
+                        }`}
+                      >
+                        {isSelected && <span className="w-2 h-2 rounded-full bg-slate-950" />}
+                      </span>
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                          <span className="text-sm sm:text-base font-black text-slate-100">
+                            {lang === 'ar' ? plan.titleAr : plan.titleEn}
+                          </span>
+                          {plan.bestValue && (
+                            <span className="text-xs font-bold text-emerald-400">
+                              · {lang === 'ar' ? 'الأكثر توفيراً' : 'Best Value'}
                             </span>
-                            {plan.bestValue && (
-                              <span className="text-xs font-bold text-emerald-400">
-                                · {lang === 'ar' ? 'الأكثر توفيراً' : 'Best Value'}
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-[11px] text-amber-300/90 font-semibold">
-                            {lang === 'ar'
-                              ? `على 3 دفعات · الدفعة الأولى ${formatAmount(firstPart, planCurrency)}`
-                              : `3 installments · 1st payment ${formatAmount(firstPart, planCurrency)}`}
-                          </div>
+                          )}
                         </div>
-                      </div>
-
-                      <div className="text-end shrink-0">
-                        <div className="text-lg sm:text-xl font-black text-amber-300 font-mono tabular-nums whitespace-nowrap">
-                          {priceLabel}
+                        <div className="text-[11px] text-slate-400 font-mono">
+                          SKU: {plan.sku}
+                          {plan.livePrice
+                            ? lang === 'ar'
+                              ? ' · سعر Google Play المباشر'
+                              : ' · Live Google Play Price'
+                            : ''}
                         </div>
-                        <div className="text-[11px] text-slate-400 whitespace-nowrap">
-                          / {periodLabel}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* 3-Installment Schedule Breakdown for Selected Plan */}
-              <div className="p-3.5 rounded-2xl bg-slate-950/90 border border-amber-500/30 space-y-2.5">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-black text-amber-300">
-                    {lang === 'ar' ? 'تقسيم الدفع على 3 دفعات متساوية' : 'Split Payment into 3 Installments'}
-                  </span>
-                  <span className="text-slate-400 font-mono tabular-nums">
-                    {lang === 'ar'
-                      ? `الإجمالي: ${formatAmount(selectedPlanTotal, selectedPlanCurrency)}`
-                      : `Total: ${formatAmount(selectedPlanTotal, selectedPlanCurrency)}`}
-                  </span>
-                </div>
-                <div className="grid grid-cols-3 gap-2">
-                  {selectedInstallments.map((amt, idx) => (
-                    <div
-                      key={idx}
-                      className={`p-2.5 rounded-xl border text-center ${
-                        idx === 0
-                          ? 'bg-amber-500/15 border-amber-400/50 text-amber-200'
-                          : 'bg-slate-900/90 border-slate-800 text-slate-300'
-                      }`}
-                    >
-                      <div className="text-[11px] font-bold">
-                        {lang === 'ar' ? `الدفعة ${idx + 1}` : `Part ${idx + 1}`}
-                      </div>
-                      <div className="text-sm font-black font-mono tabular-nums mt-0.5">
-                        {formatAmount(amt, selectedPlanCurrency)}
-                      </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5">
-                        {idx === 0
-                          ? lang === 'ar'
-                            ? 'تُدفع الآن'
-                            : 'Due today'
-                          : idx === 1
-                          ? lang === 'ar'
-                            ? 'بعد 30 يوماً'
-                            : 'In 30 days'
-                          : lang === 'ar'
-                          ? 'بعد 60 يوماً'
-                          : 'In 60 days'}
                       </div>
                     </div>
-                  ))}
-                </div>
-              </div>
+
+                    <div className="text-end shrink-0">
+                      <div className="text-lg sm:text-xl font-black text-amber-300 font-mono tabular-nums whitespace-nowrap">
+                        {priceLabel}
+                      </div>
+                      <div className="text-[11px] text-slate-400 whitespace-nowrap">
+                        {periodLabel}
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
 
@@ -650,29 +491,12 @@ export const VipMembershipModal: React.FC<VipMembershipModalProps> = ({
                       <Crown className="w-5 h-5" />
                       <span>
                         {lang === 'ar'
-                          ? `اشترك الآن — الدفعة الأولى ${formatAmount(selectedInstallments[0], selectedPlanCurrency)} (على 3 دفعات)`
-                          : `Subscribe Now — 1st of 3 Installments: ${formatAmount(selectedInstallments[0], selectedPlanCurrency)}`}
+                          ? `اشترك الآن — ${getDisplayPrice(selectedPlan)} ${selectedPlan.periodLabelAr}`
+                          : `Subscribe Now — ${getDisplayPrice(selectedPlan)} ${selectedPlan.periodLabelEn}`}
                       </span>
                     </>
                   )}
                 </button>
-
-                {/* Browser Preview Sandbox Test Action */}
-                {showPlayNotice && snap.provider === 'web_preview' && (
-                  <button
-                    type="button"
-                    onClick={handleSandboxTestUnlock}
-                    disabled={snap.isLoading}
-                    className="w-full min-h-[44px] py-2.5 px-5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/50 text-emerald-300 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <LockOpen className="w-4 h-4" />
-                    <span>
-                      {lang === 'ar'
-                        ? `تفعيل تجريبي للاختبار (${selectedPlan.sku}) وحفظ في Firebase`
-                        : `Test Sandbox Activation (${selectedPlan.sku}) & Save to Firebase`}
-                    </span>
-                  </button>
-                )}
               </>
             ) : (
               <button
