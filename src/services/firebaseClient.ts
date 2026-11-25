@@ -1,5 +1,6 @@
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import { getDatabase, Database, ref, onValue, off } from 'firebase/database';
+import type { Analytics } from 'firebase/analytics';
 
 // Firebase Web App configuration (supports Cloudflare Pages VITE_FIREBASE_* env overrides)
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env || {};
@@ -22,27 +23,41 @@ export const firebaseApp: FirebaseApp =
 
 export const rtdb: Database = getDatabase(firebaseApp, firebaseConfig.databaseURL);
 
-let analyticsInitialized = false;
+export let analytics: Analytics | null = null;
+let analyticsInitAttempted = false;
 
 /**
- * Lazily initialize Firebase Analytics only when online and supported by the browser/WebView.
+ * Initialize Firebase Analytics safely when online and supported by the browser/WebView.
  */
 export function initFirebaseAnalyticsIfOnline(): void {
-  if (analyticsInitialized || typeof window === 'undefined') return;
+  if (analyticsInitAttempted || typeof window === 'undefined') return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
-  analyticsInitialized = true;
+  analyticsInitAttempted = true;
   import('firebase/analytics')
     .then(async ({ getAnalytics, isSupported }) => {
       try {
         const supported = await isSupported();
         if (supported) {
-          getAnalytics(firebaseApp);
+          analytics = getAnalytics(firebaseApp);
         }
       } catch {
         // Analytics unavailable in restricted WebView/offline contexts
       }
     })
     .catch(() => {});
+}
+
+// Automatically initialize Firebase Analytics on app load when online (or once connection returns)
+if (typeof window !== 'undefined') {
+  if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+    initFirebaseAnalyticsIfOnline();
+  } else {
+    const onOnline = () => {
+      window.removeEventListener('online', onOnline);
+      initFirebaseAnalyticsIfOnline();
+    };
+    window.addEventListener('online', onOnline);
+  }
 }
 
 /**
