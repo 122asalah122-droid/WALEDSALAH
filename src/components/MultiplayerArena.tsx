@@ -1546,7 +1546,31 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     setIsRevivalOpen(false);
     setWrongConfirmOptionIdx(null);
     if (matchType === '1v1_friend') {
-      handleConfirmForfeit();
+      forfeitSentRef.current = true;
+      autoAdvanceTimersRef.current.forEach((t) => clearTimeout(t));
+      autoAdvanceTimersRef.current = [];
+      speechService.stop();
+      sounds.stopTensionAmbience();
+      sounds.stopIntroTheme();
+      rtcCallManager.stopMatchMicSession();
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+      setIsTimerRunning(false);
+      setServerQuestions([]);
+      forfeitRoom({
+        roomCode,
+        playerId: myPlayerId,
+        role: myRole,
+        matchType,
+        playerName,
+      }).catch(() => {});
+      try {
+        window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+        document.documentElement.scrollTop = 0;
+        document.body.scrollTop = 0;
+      } catch {}
+      onExit();
       return;
     }
     const idxToSubmit = wrongConfirmOptionIdx !== null ? wrongConfirmOptionIdx : 0;
@@ -3031,8 +3055,8 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
             <p className="text-xs text-slate-300 leading-relaxed">
               {matchType === '1v1_friend'
                 ? lang === 'ar'
-                  ? `رصيدك الحالي: ${userPoints} نقطة — يمكنك خصم 50 نقطة للمواصلة ومحاولة الإجابة على نفس السؤال، أو الضغط على «انسحاب» للانسحاب من التحدي.`
-                  : `Current balance: ${userPoints} pts — Spend 50 points to continue on this question, or choose Withdraw to forfeit the duel.`
+                  ? `رصيدك الحالي: ${userPoints} نقطة — يمكنك خصم 50 نقطة للمواصلة ومحاولة الإجابة على نفس السؤال، أو الضغط على «انسحاب» للخروج من التحدي والعودة للقائمة الرئيسية.`
+                  : `Current balance: ${userPoints} pts — Spend 50 points to continue on this question, or choose Withdraw to exit and return to the main menu.`
                 : lang === 'ar'
                 ? `رصيدك الحالي: ${userPoints} نقطة — يمكنك خصم 50 نقطة للمواصلة ومحاولة الإجابة على نفس السؤال، أو عدم الخصم وتسجيل الإجابة الخاطئة.`
                 : `Current balance: ${userPoints} pts — Spend 50 points to continue on this question, or record the wrong answer without deducting.`}

@@ -22,6 +22,7 @@ export function isSupportedVipSku(sku: string): sku is VipPlanSku {
 export const VIDEO_QUOTA_LIMIT_MINUTES = 120;
 export const VIDEO_QUOTA_LIMIT_SECONDS = VIDEO_QUOTA_LIMIT_MINUTES * 60; // 7,200 seconds
 export const VIDEO_QUOTA_CYCLE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+export const VIP_INSTALLMENTS_COUNT = 3 as const;
 
 export type BillingProvider = 'android_play_billing' | 'twa_digital_goods' | 'web_preview';
 
@@ -49,6 +50,23 @@ export interface VideoQuotaRecord {
   updatedAt: number;
 }
 
+export interface VipInstallmentItem {
+  number: 1 | 2 | 3;
+  amount: number;
+  dueAt: number;
+  paidAt: number | null;
+  status: 'paid' | 'upcoming';
+}
+
+export interface VipInstallmentPlan {
+  totalInstallments: 3;
+  paidInstallments: number;
+  totalAmount: number;
+  currency: string;
+  schedule: VipInstallmentItem[];
+  updatedAt: number;
+}
+
 export interface VipSubscriptionRecord {
   isVIP: boolean;
   isVip: boolean;
@@ -62,6 +80,7 @@ export interface VipSubscriptionRecord {
   purchasedAt?: number | null;
   expiresAt?: number | null;
   autoRenewing?: boolean;
+  installmentPlan?: VipInstallmentPlan | null;
   videoQuota: VideoQuotaRecord;
   updatedAt: number;
 }
@@ -80,6 +99,7 @@ export interface VipServiceSnapshot {
   purchasedAt: number | null;
   expiresAt: number | null;
   autoRenewing: boolean;
+  installmentPlan: VipInstallmentPlan | null;
   // Monthly Camera Quota (120 min / 30 days)
   videoLimitSeconds: number;
   videoUsedSeconds: number;
@@ -241,6 +261,82 @@ function getPlanDurationMs(sku: VipPlanSku): number {
   return (plan?.durationDays || 30) * DAY_MS;
 }
 
+export function computeThreeInstallments(totalAmount: number): [number, number, number] {
+  const safeTotal = Math.max(3, Math.round(Number.isFinite(totalAmount) ? totalAmount : 120));
+  const base = Math.floor(safeTotal / 3);
+  const rem = safeTotal - base * 3;
+  return [
+    base + (rem >= 1 ? 1 : 0),
+    base + (rem >= 2 ? 1 : 0),
+    base,
+  ];
+}
+
+export function getPlanNumericAmount(plan: VipPlanOption): number {
+  if (plan.livePrice) {
+    const cleaned = plan.livePrice.replace(/[^0-9.]/g, '');
+    const parsed = Number.parseFloat(cleaned);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.round(parsed);
+  }
+  const fallback = Number.parseFloat(plan.fallbackNumericPrice);
+  return Number.isFinite(fallback) && fallback > 0 ? Math.round(fallback) : 120;
+}
+
+function createThreeInstallmentPlan(
+  sku: VipPlanSku,
+  now = Date.now(),
+  plans: VipPlanOption[] = DEFAULT_VIP_PLANS
+): VipInstallmentPlan {
+  const plan = plans.find((p) => p.sku === sku) || DEFAULT_VIP_PLANS[0];
+  const totalAmount = getPlanNumericAmount(plan);
+  const currency = plan.liveCurrency || plan.fallbackCurrency || 'EGP';
+  const [p1, p2, p3] = computeThreeInstallments(totalAmount);
+  return {
+    totalInstallments: 3,
+    paidInstallments: 1,
+    totalAmount,
+    currency,
+    schedule: [
+      { number: 1, amount: p1, dueAt: now, paidAt: now, status: 'paid' },
+      { number: 2, amount: p2, dueAt: now + 30 * DAY_MS, paidAt: null, status: 'upcoming' },
+      { number: 3, amount: p3, dueAt: now + 60 * DAY_MS, paidAt: null, status: 'upcoming' },
+    ],
+    updatedAt: now,
+  };
+}
+
+function normalizeInstallmentPlan(
+  raw: Partial<VipInstallmentPlan> | null | undefined,
+  sku: VipPlanSku,
+  purchasedAt = Date.now()
+): VipInstallmentPlan {
+  if (
+    raw &&
+    Array.isArray(raw.schedule) &&
+    raw.schedule.length === 3 &&
+    typeof raw.totalAmount === 'number' &&
+    raw.totalAmount > 0
+  ) {
+    const schedule = raw.schedule.slice(0, 3).map((item, idx) => ({
+      number: (idx + 1) as 1 | 2 | 3,
+      amount: typeof item.amount === 'number' && item.amount > 0 ? item.amount : Math.round(raw.totalAmount! / 3),
+      dueAt: typeof item.dueAt === 'number' ? item.dueAt : purchasedAt + idx * 30 * DAY_MS,
+      paidAt: typeof item.paidAt === 'number' ? item.paidAt : null,
+      status: item.status === 'paid' ? ('paid' as const) : ('upcoming' as const),
+    }));
+    const paidCount = schedule.filter((s) => s.status === 'paid').length;
+    return {
+      totalInstallments: 3,
+      paidInstallments: Math.max(1, Math.min(3, paidCount)),
+      totalAmount: raw.totalAmount,
+      currency: raw.currency || 'EGP',
+      schedule,
+      updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+    };
+  }
+  return createThreeInstallmentPlan(sku, purchasedAt);
+}
+
 function getOrCreateStablePlayerId(): string {
   try {
     const existing = localStorage.getItem(STORAGE_UID_KEY);
@@ -311,6 +407,14 @@ class VipBillingService {
       purchasedAt: cached?.purchasedAt || null,
       expiresAt: cached?.expiresAt || null,
       autoRenewing: cached?.autoRenewing ?? false,
+      installmentPlan:
+        cached?.isVIP || cached?.isVip
+          ? normalizeInstallmentPlan(
+              cached.installmentPlan,
+              cached.productId && isSupportedVipSku(cached.productId) ? cached.productId : VIP_MONTHLY_SKU,
+              cached.purchasedAt || Date.now()
+            )
+          : null,
       videoLimitSeconds: quota.limitSeconds,
       videoUsedSeconds: quota.usedSeconds,
       videoRemainingSeconds: remainingSec,
@@ -573,6 +677,7 @@ class VipBillingService {
             purchasedAt: val.purchasedAt || Date.now(),
             expiresAt: val.expiresAt || Date.now() + getPlanDurationMs(sku),
             autoRenewing: val.autoRenewing ?? true,
+            installmentPlan: normalizeInstallmentPlan(val.installmentPlan, sku, val.purchasedAt || Date.now()),
             videoQuota: mergedQuota,
             updatedAt: val.updatedAt || Date.now(),
           });
@@ -623,6 +728,7 @@ class VipBillingService {
           purchasedAt: parsed.purchasedAt || null,
           expiresAt: parsed.expiresAt || null,
           autoRenewing: parsed.autoRenewing ?? true,
+          installmentPlan: normalizeInstallmentPlan(parsed.installmentPlan, sku, parsed.purchasedAt || Date.now()),
           videoQuota: normalizeVideoQuota(parsed.videoQuota),
           updatedAt: parsed.updatedAt || Date.now(),
         };
@@ -652,10 +758,15 @@ class VipBillingService {
   private applyVipLocally(record: VipSubscriptionRecord): void {
     const quota = normalizeVideoQuota(record.videoQuota);
     const remainingSec = Math.max(0, quota.limitSeconds - quota.usedSeconds);
+    const isVipNow = record.isVIP === true || record.isVip === true;
+    const installmentPlan = isVipNow
+      ? normalizeInstallmentPlan(record.installmentPlan, record.productId, record.purchasedAt || Date.now())
+      : null;
     const normalizedRecord: VipSubscriptionRecord = {
       ...record,
-      isVIP: record.isVIP === true || record.isVip === true,
-      isVip: record.isVIP === true || record.isVip === true,
+      isVIP: isVipNow,
+      isVip: isVipNow,
+      installmentPlan,
       videoQuota: quota,
     };
 
@@ -672,6 +783,7 @@ class VipBillingService {
       purchasedAt: normalizedRecord.purchasedAt || null,
       expiresAt: normalizedRecord.expiresAt || null,
       autoRenewing: normalizedRecord.autoRenewing ?? true,
+      installmentPlan,
       videoLimitSeconds: quota.limitSeconds,
       videoUsedSeconds: quota.usedSeconds,
       videoRemainingSeconds: remainingSec,
@@ -729,6 +841,8 @@ class VipBillingService {
         })
       : createFreshVideoQuota(now);
 
+    const installmentPlan = createThreeInstallmentPlan(params.productId, now, this.state.plans);
+
     const record: VipSubscriptionRecord = {
       isVIP: true,
       isVip: true,
@@ -742,6 +856,7 @@ class VipBillingService {
       purchasedAt: now,
       expiresAt: now + getPlanDurationMs(params.productId),
       autoRenewing: params.autoRenewing ?? true,
+      installmentPlan,
       videoQuota: currentQuota,
       updatedAt: Date.now(),
     };
@@ -749,7 +864,7 @@ class VipBillingService {
     // Update UI & localStorage immediately so Mic, Camera & Ad Removal unlock without delay
     this.applyVipLocally(record);
 
-    // Persist VIP membership (with isVIP: true + monthly 120-min videoQuota) to Firebase Realtime Database
+    // Persist VIP membership (with isVIP: true + 3-installment plan + monthly 120-min videoQuota) to Firebase RTDB
     try {
       const vipRef = ref(rtdb, `users/${this.playerId}/vip`);
       await set(vipRef, {
@@ -765,6 +880,7 @@ class VipBillingService {
         purchasedAt: record.purchasedAt,
         expiresAt: record.expiresAt,
         autoRenewing: record.autoRenewing,
+        installmentPlan,
         videoQuota: {
           limitSeconds: currentQuota.limitSeconds,
           usedSeconds: currentQuota.usedSeconds,
@@ -1129,6 +1245,7 @@ class VipBillingService {
           purchasedAt: val.purchasedAt || Date.now(),
           expiresAt: val.expiresAt || Date.now() + getPlanDurationMs(sku),
           autoRenewing: val.autoRenewing ?? true,
+          installmentPlan: normalizeInstallmentPlan(val.installmentPlan, sku, val.purchasedAt || Date.now()),
           videoQuota: normalizeVideoQuota(val.videoQuota),
           updatedAt: val.updatedAt || Date.now(),
         });
@@ -1141,6 +1258,54 @@ class VipBillingService {
     this.state = { ...this.state, isLoading: false };
     this.emit();
     return { restored: false };
+  }
+
+  /**
+   * Pays the next upcoming installment (2nd or 3rd of 3) and persists progress to Firebase RTDB.
+   */
+  public async payNextInstallment(): Promise<{ success: boolean; paidNumber?: number; completed?: boolean }> {
+    if (!this.state.isVip || !this.state.installmentPlan) return { success: false };
+    const plan = this.state.installmentPlan;
+    const nextIdx = plan.schedule.findIndex((item) => item.status !== 'paid');
+    if (nextIdx === -1) return { success: false, completed: true };
+
+    const now = Date.now();
+    const updatedSchedule = plan.schedule.map((item, idx) =>
+      idx === nextIdx ? { ...item, status: 'paid' as const, paidAt: now } : item
+    );
+    const paidInstallments = updatedSchedule.filter((item) => item.status === 'paid').length;
+    const updatedPlan: VipInstallmentPlan = {
+      ...plan,
+      paidInstallments,
+      schedule: updatedSchedule,
+      updatedAt: now,
+    };
+
+    const cached = this.loadCachedVip();
+    if (cached) {
+      this.saveCachedVip({ ...cached, installmentPlan: updatedPlan, updatedAt: now });
+    }
+    this.state = {
+      ...this.state,
+      installmentPlan: updatedPlan,
+    };
+    this.emit();
+
+    try {
+      const vipRef = ref(rtdb, `users/${this.playerId}/vip`);
+      await update(vipRef, {
+        installmentPlan: updatedPlan,
+        updatedAt: now,
+      });
+    } catch {
+      // Safe offline fallback
+    }
+
+    return {
+      success: true,
+      paidNumber: updatedSchedule[nextIdx].number,
+      completed: paidInstallments >= 3,
+    };
   }
 
   /**

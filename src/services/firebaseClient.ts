@@ -2,20 +2,16 @@ import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import { getDatabase, Database, ref, onValue, off } from 'firebase/database';
 import type { Analytics } from 'firebase/analytics';
 
-// Firebase Web App configuration (supports Cloudflare Pages VITE_FIREBASE_* env overrides)
-const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env || {};
-
+// Firebase Web App configuration directly embedded in code (no environment variables)
 export const firebaseConfig = {
-  apiKey: env.VITE_FIREBASE_API_KEY || 'AIzaSyBBw-oFUmt8e1AeO4nzzG6GLpNbyQT5I5E',
-  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || 'gen-lang-client-0032838250.firebaseapp.com',
-  databaseURL:
-    env.VITE_FIREBASE_DATABASE_URL ||
-    'https://gen-lang-client-0032838250-default-rtdb.firebaseio.com',
-  projectId: env.VITE_FIREBASE_PROJECT_ID || 'gen-lang-client-0032838250',
-  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || 'gen-lang-client-0032838250.firebasestorage.app',
-  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || '878148503555',
-  appId: env.VITE_FIREBASE_APP_ID || '1:878148503555:web:b7c046af142fd893646636',
-  measurementId: env.VITE_FIREBASE_MEASUREMENT_ID || 'G-C028J7MG6K',
+  apiKey: "AIzaSyBBw-oFUmt8e1AeO4nzzG6GLpNbyQT5I5E",
+  authDomain: "gen-lang-client-0032838250.firebaseapp.com",
+  databaseURL: "https://gen-lang-client-0032838250-default-rtdb.firebaseio.com",
+  projectId: "gen-lang-client-0032838250",
+  storageBucket: "gen-lang-client-0032838250.firebasestorage.app",
+  messagingSenderId: "878148503555",
+  appId: "1:878148503555:web:b7c046af142fd893646636",
+  measurementId: "G-C028J7MG6K",
 };
 
 export const firebaseApp: FirebaseApp =
