@@ -36,9 +36,6 @@ android {
 }
 
 dependencies {
-    // Official Google Play Billing Library (Kotlin Extensions)
-    implementation("com.android.billingclient:billing-ktx:7.1.1")
-
     // AndroidX Core & WebView support for Cloudflare Pages / WebRTC frontend
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")

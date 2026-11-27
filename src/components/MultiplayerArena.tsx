@@ -36,7 +36,6 @@ import {
   KeyRound,
   Ban,
   Flag,
-  Crown,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { Question, Language, ChatMessage, DuelRole, AudienceVoteResult, PhoneFriendResult, UserProfile } from '../types/game';
@@ -82,8 +81,6 @@ interface MultiplayerArenaProps {
   onActiveRoomChange?: (roomCode: string) => void;
   onOpenPrivateCallRoom?: () => void;
   onRewardsUnlocked?: (awards: NewlyUnlockedReward[]) => void;
-  isVip?: boolean;
-  onOpenVip?: () => void;
 }
 
 const CATEGORIES: { key: string; ar: string; en: string; icon: string; descAr: string }[] = [
@@ -185,8 +182,6 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
   onActiveRoomChange,
   onOpenPrivateCallRoom,
   onRewardsUnlocked,
-  isVip = false,
-  onOpenVip,
 }) => {
   // Unique Per-Tab + Per-Device Fingerprint so multiple tabs & global devices never collide
   const myDeviceId = useMemo(() => {
@@ -364,19 +359,19 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
     }
   }, [roomCode, onActiveRoomChange]);
 
-  // Connect live WebRTC Mesh voice session for BOTH 1v1 & 4-Player rooms once VIP is active
+  // Connect live WebRTC Mesh voice session for BOTH 1v1 & 4-Player rooms
   useEffect(() => {
-    if (isVip && (arenaState === 'playing' || arenaState === 'waiting_friend') && roomCode && !rtcInCall) {
+    if ((arenaState === 'playing' || arenaState === 'waiting_friend') && roomCode && !rtcInCall) {
       sounds.stopIntroTheme();
       sounds.stopTensionAmbience();
       rtcCallManager.startMatchMicSession(roomCode).catch(() => {});
       return () => {
         // Only tear down if leaving the active room entirely (handled when arenaState changes away)
       };
-    } else if (!isVip || (arenaState !== 'playing' && arenaState !== 'waiting_friend')) {
+    } else if (arenaState !== 'playing' && arenaState !== 'waiting_friend') {
       rtcCallManager.stopMatchMicSession();
     }
-  }, [arenaState, roomCode, rtcInCall, isVip]);
+  }, [arenaState, roomCode, rtcInCall]);
 
   // Ensure mic session is always stopped on unmount
   useEffect(() => {
@@ -2379,48 +2374,30 @@ export const MultiplayerArena: React.FC<MultiplayerArenaProps> = ({
 
               {/* Mic Button directly next to Lifelines for both 1v1 and Group play */}
               <button
-                onClick={() => {
-                  if (!isVip) {
-                    onOpenVip?.();
-                    return;
-                  }
-                  rtcCallManager.toggleMic();
-                }}
+                onClick={() => rtcCallManager.toggleMic()}
                 className={`flex-1 py-2 px-2 rounded-xl border flex flex-col items-center gap-1 transition active:scale-95 ${
-                  !isVip
-                    ? 'bg-amber-500/15 border-amber-500/60 text-amber-300 hover:bg-amber-500/25'
-                    : micOn
+                  micOn
                     ? 'bg-emerald-500/15 border-emerald-500/60 text-emerald-300 hover:bg-emerald-500/25'
                     : 'bg-rose-500/15 border-rose-500/60 text-rose-300 hover:bg-rose-500/25'
                 }`}
                 title={
-                  !isVip
-                    ? lang === 'ar'
-                      ? 'افتح الميكروفون عبر عضوية VIP'
-                      : 'Unlock Microphone with VIP'
-                    : lang === 'ar'
+                  lang === 'ar'
                     ? 'فتح أو قفل الميكروفون'
                     : 'Open or Close Microphone'
                 }
               >
                 <div className="flex items-center gap-1">
-                  {!isVip ? (
-                    <Crown className="w-4 h-4 text-amber-400" />
-                  ) : micOn ? (
+                  {micOn ? (
                     <Mic className="w-4 h-4 text-emerald-400" />
                   ) : (
                     <MicOff className="w-4 h-4 text-rose-400" />
                   )}
-                  {isVip && micOn && micLevel > 10 && (
+                  {micOn && micLevel > 10 && (
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                   )}
                 </div>
                 <span className="text-[10px] font-black">
-                  {!isVip
-                    ? lang === 'ar'
-                      ? 'مايك VIP'
-                      : 'VIP Mic'
-                    : micOn
+                  {micOn
                     ? lang === 'ar'
                       ? 'المايك مفتوح'
                       : 'Mic ON'

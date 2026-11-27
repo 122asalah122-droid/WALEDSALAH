@@ -1,5 +1,5 @@
 import React from 'react';
-import { Volume2, VolumeX, Globe, Settings, Users, Sparkles, Trophy, Coins, ArrowLeft, ArrowRight, Award, Crown } from 'lucide-react';
+import { Volume2, VolumeX, Globe, Settings, Users, Sparkles, Trophy, Coins, ArrowLeft, ArrowRight, Award } from 'lucide-react';
 import { Language, GameMode, UserProfile } from '../types/game';
 import { sounds } from '../utils/soundEffects';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -23,8 +23,6 @@ interface GameHeaderProps {
   onOpenBadges?: () => void;
   badgesCount?: number;
   hasDailyGift?: boolean;
-  isVip?: boolean;
-  onOpenVip?: () => void;
 }
 
 export const GameHeader: React.FC<GameHeaderProps> = ({
@@ -46,8 +44,6 @@ export const GameHeader: React.FC<GameHeaderProps> = ({
   onOpenBadges,
   badgesCount = 0,
   hasDailyGift = false,
-  isVip = false,
-  onOpenVip,
 }) => {
   return (
     <header className="sticky top-0 z-40 w-full max-w-full overflow-x-hidden bg-slate-950/95 border-b border-slate-800/90">
@@ -147,23 +143,6 @@ export const GameHeader: React.FC<GameHeaderProps> = ({
               {hasDailyGift && (
                 <span className="w-2 h-2 rounded-full bg-emerald-400 absolute -top-0.5 -right-0.5" />
               )}
-            </button>
-          )}
-
-          {/* VIP Membership Button */}
-          {onOpenVip && (
-            <button
-              type="button"
-              onClick={onOpenVip}
-              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1 sm:py-1.5 rounded-xl text-xs font-black transition-colors shadow-sm active:scale-95 border whitespace-nowrap shrink-0 ${
-                isVip
-                  ? 'bg-gradient-to-r from-amber-500 to-amber-400 border-amber-300 text-slate-950'
-                  : 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/50 text-amber-300'
-              }`}
-              title={lang === 'ar' ? 'عضوية VIP — فتح المايك والكاميرا بدون إعلانات' : 'VIP Membership — Unlock Mic, Camera & No Ads'}
-            >
-              <Crown className="w-3.5 h-3.5 shrink-0" />
-              <span>{isVip ? 'VIP ✓' : 'VIP'}</span>
             </button>
           )}
 

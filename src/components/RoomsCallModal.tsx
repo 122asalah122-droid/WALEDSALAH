@@ -18,7 +18,6 @@ import {
   Flag,
   ShieldCheck,
   Wifi,
-  Crown,
 } from 'lucide-react';
 import { ChatMessage, Language, UserProfile } from '../types/game';
 import {
@@ -34,11 +33,6 @@ import {
   sendRoomMessage,
   deleteRoomMessage,
 } from '../services/firebaseRoomService';
-import {
-  vipBillingService,
-  VipServiceSnapshot,
-  VIDEO_QUOTA_LIMIT_MINUTES,
-} from '../services/vipBillingService';
 
 interface RoomsCallModalProps {
   isOpen: boolean;
@@ -48,8 +42,6 @@ interface RoomsCallModalProps {
   initialTab?: 'public' | 'private';
   privateRoomId: string;
   onChangePrivateRoomId: (roomId: string) => void;
-  isVip?: boolean;
-  onOpenVip?: () => void;
 }
 
 export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
@@ -59,8 +51,6 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
   userProfile,
   privateRoomId,
   onChangePrivateRoomId,
-  isVip = false,
-  onOpenVip,
 }) => {
   const [joinInput, setJoinInput] = useState<string>('');
   const [joinError, setJoinError] = useState<string>('');
@@ -70,7 +60,6 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
   const [showBlockedList, setShowBlockedList] = useState<boolean>(false);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
   const [snap, setSnap] = useState<RtcSnapshot>(() => rtcCallManager.getSnapshot());
-  const [vipSnap, setVipSnap] = useState<VipServiceSnapshot>(() => vipBillingService.getSnapshot());
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
 
@@ -83,10 +72,6 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
 
   useEffect(() => {
     return rtcCallManager.subscribe(setSnap);
-  }, []);
-
-  useEffect(() => {
-    return vipBillingService.subscribe(setVipSnap);
   }, []);
 
   useEffect(() => {
@@ -371,32 +356,20 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
         <div className="p-3 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <button
-              onClick={() => {
-                if (!isVip) {
-                  onOpenVip?.();
-                  return;
-                }
-                rtcCallManager.toggleMic();
-              }}
+              onClick={() => rtcCallManager.toggleMic()}
               className={`px-3 py-2 rounded-xl border text-xs font-black flex items-center gap-1.5 transition ${
-                !isVip
-                  ? 'bg-amber-500/15 border-amber-500/50 text-amber-300 hover:bg-amber-500/25'
-                  : snap.micOn
+                snap.micOn
                   ? 'bg-emerald-500/15 border-emerald-500/60 text-emerald-300'
                   : 'bg-rose-500/15 border-rose-500/60 text-rose-300'
               }`}
             >
-              {!isVip ? (
-                <Crown className="w-4 h-4 text-amber-400" />
-              ) : snap.micOn ? (
+              {snap.micOn ? (
                 <Mic className="w-4 h-4" />
               ) : (
                 <MicOff className="w-4 h-4" />
               )}
               <span>
-                {!isVip
-                  ? (lang === 'ar' ? 'المايك (VIP)' : 'Mic (VIP)')
-                  : snap.micOn
+                {snap.micOn
                   ? (lang === 'ar' ? 'المايك مفتوح' : 'Mic Open')
                   : (lang === 'ar' ? 'المايك مقفول' : 'Mic Closed')}
               </span>
@@ -424,90 +397,23 @@ export const RoomsCallModal: React.FC<RoomsCallModalProps> = ({
             ) : (
               <>
                 <button
-                  onClick={() => {
-                    if (!isVip) {
-                      onOpenVip?.();
-                      return;
-                    }
-                    if (!vipBillingService.canUseCamera()) {
-                      vipBillingService.setQuotaAlert(lang);
-                      return;
-                    }
-                    rtcCallManager.startCall(selectedRoomId, 'video');
-                  }}
-                  className={`px-3 py-2 rounded-xl font-black text-xs flex items-center gap-1.5 shadow ${
-                    !isVip
-                      ? 'bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300'
-                      : vipSnap.videoQuotaExhausted
-                      ? 'bg-slate-800 border border-rose-500/50 text-rose-300'
-                      : 'bg-blue-600 hover:bg-blue-500 text-white'
-                  }`}
+                  onClick={() => rtcCallManager.startCall(selectedRoomId, 'video')}
+                  className="px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-black text-xs flex items-center gap-1.5 shadow"
                 >
-                  {isVip ? <Video className="w-4 h-4" /> : <Crown className="w-4 h-4" />}
-                  <span>
-                    {!isVip
-                      ? lang === 'ar'
-                        ? 'فيديو VIP'
-                        : 'VIP Video'
-                      : vipSnap.videoQuotaExhausted
-                      ? lang === 'ar'
-                        ? 'انتهى رصيد الكاميرا'
-                        : 'Camera Limit Used'
-                      : lang === 'ar'
-                      ? `مكالمة فيديو (${vipSnap.videoRemainingMinutes} د)`
-                      : `Video (${vipSnap.videoRemainingMinutes}m)`}
-                  </span>
+                  <Video className="w-4 h-4" />
+                  <span>{lang === 'ar' ? 'مكالمة فيديو' : 'Video Call'}</span>
                 </button>
                 <button
-                  onClick={() => {
-                    if (!isVip) {
-                      onOpenVip?.();
-                      return;
-                    }
-                    rtcCallManager.startCall(selectedRoomId, 'audio');
-                  }}
-                  className={`px-3 py-2 rounded-xl font-black text-xs flex items-center gap-1.5 shadow ${
-                    isVip
-                      ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                      : 'bg-slate-800 hover:bg-slate-700 border border-amber-500/40 text-amber-300'
-                  }`}
+                  onClick={() => rtcCallManager.startCall(selectedRoomId, 'audio')}
+                  className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs flex items-center gap-1.5 shadow"
                 >
-                  {isVip ? <Phone className="w-4 h-4" /> : <Crown className="w-4 h-4" />}
-                  <span>{isVip ? (lang === 'ar' ? 'اتصال عادي' : 'Voice Call') : (lang === 'ar' ? 'صوت VIP' : 'VIP Voice')}</span>
+                  <Phone className="w-4 h-4" />
+                  <span>{lang === 'ar' ? 'اتصال عادي' : 'Voice Call'}</span>
                 </button>
               </>
             )}
           </div>
         </div>
-
-        {/* VIP Monthly Camera Quota Status Strip (Voice Mic & Chat remain unlimited) */}
-        {isVip && (
-          <div className="px-3 py-2 bg-slate-950/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px]">
-            <span className="text-slate-300 font-semibold">
-              {lang === 'ar'
-                ? `رصيد الكاميرا الشهري: ${vipSnap.videoRemainingMinutes} / ${VIDEO_QUOTA_LIMIT_MINUTES} دقيقة · المايك والدردشة بلا حدود`
-                : `Monthly Camera: ${vipSnap.videoRemainingMinutes} / ${VIDEO_QUOTA_LIMIT_MINUTES} min · Voice & Chat Unlimited`}
-            </span>
-            <span className="text-slate-400 font-mono tabular-nums">
-              {lang === 'ar'
-                ? `تجدد: ${new Date(vipSnap.videoQuotaResetAt).toLocaleDateString('ar-EG', { month: 'short', day: 'numeric' })}`
-                : `Renews: ${new Date(vipSnap.videoQuotaResetAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}
-            </span>
-          </div>
-        )}
-
-        {vipSnap.quotaAlertMessage && (
-          <div className="px-3 py-2.5 bg-rose-950/60 border-b border-rose-500/40 flex items-center justify-between gap-2 text-xs text-rose-200">
-            <span>{vipSnap.quotaAlertMessage}</span>
-            <button
-              type="button"
-              onClick={() => vipBillingService.clearQuotaAlert()}
-              className="px-2 py-1 rounded-lg bg-slate-900 text-slate-300 hover:text-white text-[11px] font-bold shrink-0"
-            >
-              {lang === 'ar' ? 'حسناً' : 'OK'}
-            </button>
-          </div>
-        )}
 
         {/* Connected Devices in Room (Firebase RTDB + WebRTC Presence) with Block Caller button */}
         {roomPeers.length > 0 && (

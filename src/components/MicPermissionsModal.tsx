@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Mic, Volume2, ShieldCheck, ArrowRight, AlertTriangle, RefreshCw, Crown, Lock } from 'lucide-react';
+import { Mic, Volume2, ShieldCheck, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react';
 import { Language } from '../types/game';
 import { rtcCallManager } from '../services/rtcCallManager';
 import { sounds } from '../utils/soundEffects';
@@ -9,8 +9,6 @@ interface MicPermissionsModalProps {
   isOpen: boolean;
   lang: Language;
   modeLabel: string;
-  isVip?: boolean;
-  onOpenVip?: () => void;
   onCancel: () => void;
   onContinue: (micGranted: boolean) => void;
 }
@@ -19,8 +17,6 @@ export const MicPermissionsModal: React.FC<MicPermissionsModalProps> = ({
   isOpen,
   lang,
   modeLabel,
-  isVip = false,
-  onOpenVip,
   onCancel,
   onContinue,
 }) => {
@@ -113,80 +109,40 @@ export const MicPermissionsModal: React.FC<MicPermissionsModalProps> = ({
         )}
 
         <div className="space-y-2.5 pt-1">
-          {!isVip ? (
-            <>
-              <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/40 text-xs text-amber-200 text-start flex items-start gap-2 leading-relaxed">
-                <Lock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                <span>
-                  {lang === 'ar'
-                    ? 'فتح الميكروفون والكاميرا المباشرة ميزة خاصة بأعضاء VIP. يمكنك الاشتراك الآن أو الدخول للعب بدون مايك.'
-                    : 'Live Microphone & Camera are VIP perks. Subscribe to VIP to unlock them or enter in text/quiz mode.'}
-                </span>
-              </div>
-
-              {onOpenVip && (
-                <button
-                  type="button"
-                  onClick={onOpenVip}
-                  className="w-full py-3.5 px-5 rounded-2xl bg-gradient-to-r from-amber-500 via-amber-400 to-amber-500 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-black text-sm shadow-xl shadow-amber-500/20 flex items-center justify-center gap-2 transition active:scale-98"
-                >
-                  <Crown className="w-4 h-4" />
-                  <span>{lang === 'ar' ? 'فتح المايك والكاميرا (اشترك VIP)' : 'Unlock Mic & Camera (Go VIP)'}</span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={() => {
-                  sounds.stopIntroTheme();
-                  sounds.stopTensionAmbience();
-                  speechService.prime();
-                  onContinue(false);
-                }}
-                className="w-full py-3 px-4 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-100 font-bold text-xs sm:text-sm border border-slate-700 flex items-center justify-center gap-2 transition"
-              >
-                <span>{lang === 'ar' ? 'متابعة اللعب بدون ميكروفون' : 'Continue Playing Without Mic'}</span>
+          <button
+            type="button"
+            onClick={handleRequestAndContinue}
+            disabled={requesting}
+            className="w-full py-3.5 px-5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 disabled:opacity-60 text-slate-950 font-black text-sm shadow-xl shadow-emerald-500/20 flex items-center justify-center gap-2 transition active:scale-98"
+          >
+            {requesting ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                <span>{lang === 'ar' ? 'جاري طلب إذن الميكروفون...' : 'Requesting Microphone...'}</span>
+              </>
+            ) : (
+              <>
+                <Mic className="w-4 h-4" />
+                <span>{errorMsg ? (lang === 'ar' ? 'إعادة المحاولة والمتابعة' : 'Retry & Continue') : (lang === 'ar' ? 'متابعة وتفعيل الميكروفون' : 'Continue & Enable Mic')}</span>
                 <ArrowRight className={`w-4 h-4 ${lang === 'ar' ? 'rotate-180' : ''}`} />
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                type="button"
-                onClick={handleRequestAndContinue}
-                disabled={requesting}
-                className="w-full py-3.5 px-5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 disabled:opacity-60 text-slate-950 font-black text-sm shadow-xl shadow-emerald-500/20 flex items-center justify-center gap-2 transition active:scale-98"
-              >
-                {requesting ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>{lang === 'ar' ? 'جاري طلب إذن الميكروفون...' : 'Requesting Microphone...'}</span>
-                  </>
-                ) : (
-                  <>
-                    <Mic className="w-4 h-4" />
-                    <span>{errorMsg ? (lang === 'ar' ? 'إعادة المحاولة والمتابعة' : 'Retry & Continue') : (lang === 'ar' ? 'متابعة وتفعيل الميكروفون (VIP)' : 'Continue & Enable Mic (VIP)')}</span>
-                    <ArrowRight className={`w-4 h-4 ${lang === 'ar' ? 'rotate-180' : ''}`} />
-                  </>
-                )}
-              </button>
+              </>
+            )}
+          </button>
 
-              {errorMsg && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    sounds.stopIntroTheme();
-                    sounds.stopTensionAmbience();
-                    onContinue(false);
-                  }}
-                  className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold text-xs border border-amber-500/30 transition"
-                >
-                  {lang === 'ar'
-                    ? 'الدخول للاستماع فقط (بدون ميكروفون)'
-                    : 'Continue in Listen-Only Mode (No Mic)'}
-                </button>
-              )}
-            </>
+          {errorMsg && (
+            <button
+              type="button"
+              onClick={() => {
+                sounds.stopIntroTheme();
+                sounds.stopTensionAmbience();
+                onContinue(false);
+              }}
+              className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold text-xs border border-amber-500/30 transition"
+            >
+              {lang === 'ar'
+                ? 'الدخول للاستماع فقط (بدون ميكروفون)'
+                : 'Continue in Listen-Only Mode (No Mic)'}
+            </button>
           )}
 
           <button
